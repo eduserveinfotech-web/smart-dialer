@@ -1,3 +1,5 @@
+import 'package:flutter/foundation.dart'
+    show kIsWeb, defaultTargetPlatform, TargetPlatform;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -60,6 +62,35 @@ enum CallType { incoming, outgoing, missed }
 
 enum CallAction { accept, reject, ai }
 
+enum CallFilter {
+  all('All'),
+  missed('Missed'),
+  dialed('Dialed'),
+  received('Received');
+
+  const CallFilter(this.label);
+  final String label;
+}
+
+class ContactEntry {
+  const ContactEntry({required this.name, required this.number});
+  final String name;
+  final String number;
+}
+
+/// Last 10 digits of a number, used to match call-log numbers to contacts.
+String numberKey(String n) {
+  final d = n.replaceAll(RegExp(r'\D'), '');
+  return d.length > 10 ? d.substring(d.length - 10) : d;
+}
+
+/// Android CallLog.Calls.TYPE -> our CallType.
+CallType callTypeFromAndroid(int t) => switch (t) {
+      2 => CallType.outgoing,
+      3 || 5 || 6 => CallType.missed, // missed, rejected, blocked
+      _ => CallType.incoming, // incoming, voicemail, other
+    };
+
 class CallRecord {
   const CallRecord({
     required this.name,
@@ -99,6 +130,33 @@ String initialsOf(String name) {
 // ─────────────────────────────────────────────────────────────
 // Home: keypad + recents
 // ─────────────────────────────────────────────────────────────
+/// Talks to MainActivity.kt (real call log, contacts, calling). Android only.
+class NativeBridge {
+  static const _ch = MethodChannel('smart_dialer/native');
+
+  static bool get available =>
+      !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
+
+  static Future<Map<String, bool>> permissionStatus() =>
+      _perms('permissionStatus');
+
+  static Future<Map<String, bool>> requestPermissions() =>
+      _perms('requestPermissions');
+
+  static Future<Map<String, bool>> _perms(String method) async {
+    final r = await _ch.invokeMapMethod<String, bool>(method);
+    return r ?? <String, bool>{};
+  }
+
+  static Future<List<Map<String, dynamic>>> rows(String method) async {
+    final raw = await _ch.invokeListMethod<dynamic>(method) ?? <dynamic>[];
+    return raw.map((e) => Map<String, dynamic>.from(e as Map)).toList();
+  }
+
+  static Future<void> call(String number) =>
+      _ch.invokeMethod<void>('call', {'number': number});
+}
+
 class HomeShell extends StatefulWidget {
   const HomeShell({super.key});
 
@@ -106,26 +164,24 @@ class HomeShell extends StatefulWidget {
   State<HomeShell> createState() => _HomeShellState();
 }
 
-class _HomeShellState extends State<HomeShell> {
+class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
   int _tab = 0;
   String _digits = '';
   bool _autoAi = true;
 
-  // Saved contacts, matched on the last 10 digits. In production replace this
-  // with the phone's real contacts (e.g. the flutter_contacts package).
-  final Map<String, String> _contacts = {
-    '9876543210': 'Priya Sharma',
-    '9415022817': 'Dad',
-    '9988776655': 'Rohan Verma',
-    '5422550101': 'City Pharmacy',
-  };
+  // Contact lookup (last 10 digits -> name) built from the phone's contacts.
+  final Map<String, String> _contacts = {};
+  List<ContactEntry> _contactRows = [];
+  bool _permissionDenied = false;
+  bool _contactsDenied = false;
+  bool _loading = false;
 
   String? _contactName(String number) {
     final d = number.replaceAll(RegExp(r'\D'), '');
     return _contacts[d.length > 10 ? d.substring(d.length - 10) : d];
   }
 
-  late final List<CallRecord> _calls = [
+  late final List<CallRecord> _calls = NativeBridge.available ? <CallRecord>[] : [
     CallRecord(
       name: 'Priya Sharma',
       number: '+91 98765 43210',
@@ -159,6 +215,106 @@ class _HomeShellState extends State<HomeShell> {
       time: DateTime.now().subtract(const Duration(days: 4)),
     ),
   ];
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    if (NativeBridge.available) {
+      _load(askPermission: true);
+    } else {
+      // Web preview / non-Android: demo contacts only.
+      _setContacts(<ContactEntry>[
+        const ContactEntry(name: 'Priya Sharma', number: '+91 98765 43210'),
+        const ContactEntry(name: 'Dad', number: '+91 94150 22817'),
+        const ContactEntry(name: 'Rohan Verma', number: '+91 99887 76655'),
+        const ContactEntry(name: 'City Pharmacy', number: '+91 542 255 0101'),
+      ]);
+    }
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // Coming back from a call or from Settings: refresh the history.
+    if (state == AppLifecycleState.resumed) _load();
+  }
+
+  void _setContacts(List<ContactEntry> rows) {
+    rows.sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
+    _contactRows = rows;
+    _contacts
+      ..clear()
+      ..addEntries(rows.map((c) => MapEntry(numberKey(c.number), c.name)));
+  }
+
+  CallRecord _recordFromRow(Map<String, dynamic> r) {
+    final number = (r['number'] as String?) ?? '';
+    final cached = (r['name'] as String?) ?? '';
+    return CallRecord(
+      name: cached.isNotEmpty ? cached : (_contactName(number) ?? ''),
+      number: number.isEmpty ? 'Private number' : number,
+      type: callTypeFromAndroid((r['type'] as num?)?.toInt() ?? 1),
+      time: DateTime.fromMillisecondsSinceEpoch(
+          (r['date'] as num?)?.toInt() ?? 0),
+    );
+  }
+
+  Future<void> _load({bool askPermission = false}) async {
+    if (!NativeBridge.available || _loading) return;
+    _loading = true;
+    try {
+      final perms = askPermission
+          ? await NativeBridge.requestPermissions()
+          : await NativeBridge.permissionStatus();
+      final logOk = perms['log'] == true;
+      final contactsOk = perms['contacts'] == true;
+
+      final contactRaw = contactsOk
+          ? await NativeBridge.rows('getContacts')
+          : <Map<String, dynamic>>[];
+      final logRaw = logOk
+          ? await NativeBridge.rows('getCallLog')
+          : <Map<String, dynamic>>[];
+      if (!mounted) return;
+
+      final seen = <String>{};
+      final contacts = <ContactEntry>[];
+      for (final r in contactRaw) {
+        final number = (r['number'] as String?) ?? '';
+        if (number.isEmpty || !seen.add(numberKey(number))) continue;
+        contacts.add(
+            ContactEntry(name: (r['name'] as String?) ?? '', number: number));
+      }
+
+      setState(() {
+        _permissionDenied = !logOk;
+        _contactsDenied = !contactsOk;
+        if (contactsOk) _setContacts(contacts);
+        _calls
+          ..clear()
+          ..addAll(logRaw.map(_recordFromRow));
+      });
+    } catch (_) {
+      if (mounted) _toast('Could not load call history');
+    } finally {
+      _loading = false;
+    }
+  }
+
+  List<ContactEntry> _suggestionsFor(String digits) {
+    final d = digits.replaceAll(RegExp(r'\D'), '');
+    if (d.length < 2) return const [];
+    return _contactRows
+        .where((c) => c.number.replaceAll(RegExp(r'\D'), '').contains(d))
+        .take(1)
+        .toList();
+  }
 
   void _log(String number, CallType type,
       {String name = '', String? aiSummary}) {
@@ -197,14 +353,25 @@ class _HomeShellState extends State<HomeShell> {
     setState(() => _digits = _digits.substring(0, _digits.length - 1));
   }
 
-  void _callNumber(String number, {String name = ''}) {
-    if (number.isEmpty) return;
-    // TODO: place a real call (url_launcher `tel:` or a ConnectionService
-    // integration on Android).
+  Future<void> _callNumber(String number, {String name = ''}) async {
+    if (!RegExp(r'\d').hasMatch(number)) return;
+    final who = name.isEmpty ? (_contactName(number) ?? number) : name;
+
+    if (NativeBridge.available) {
+      try {
+        await NativeBridge.call(number);
+        if (mounted) setState(() => _digits = '');
+      } catch (_) {
+        if (mounted) _toast('Could not place the call');
+      }
+      return;
+    }
+
+    // Web preview: pretend to call and log it.
     _log(number, CallType.outgoing,
         name: name.isEmpty ? (_contactName(number) ?? '') : name);
     setState(() => _digits = '');
-    _toast('Calling ${name.isEmpty ? number : name}');
+    _toast('Calling $who (demo)');
   }
 
   // TODO: replace with a real summary generated by your LLM after the call.
@@ -278,6 +445,8 @@ class _HomeShellState extends State<HomeShell> {
               onBackspace: _backspace,
               onClear: () => setState(() => _digits = ''),
               onCall: () => _callNumber(_digits),
+              suggestions: _suggestionsFor(_digits),
+              onPickSuggestion: (c) => _callNumber(c.number, name: c.name),
             ),
             RecentsPage(
               calls: _calls,
@@ -285,6 +454,15 @@ class _HomeShellState extends State<HomeShell> {
               onSimulateIncoming: _simulateIncoming,
               autoAi: _autoAi,
               onAutoAiChanged: (v) => setState(() => _autoAi = v),
+              permissionDenied: _permissionDenied,
+              onAllowAccess: () => _load(askPermission: true),
+              onRefresh: () => _load(),
+            ),
+            ContactsPage(
+              contacts: _contactRows,
+              onCall: (c) => _callNumber(c.number, name: c.name),
+              permissionDenied: _contactsDenied,
+              onAllowAccess: () => _load(askPermission: true),
             ),
           ],
         ),
@@ -303,6 +481,11 @@ class _HomeShellState extends State<HomeShell> {
             selectedIcon: Icon(Icons.history_toggle_off),
             label: 'Recents',
           ),
+          NavigationDestination(
+            icon: Icon(Icons.people_outline),
+            selectedIcon: Icon(Icons.people),
+            label: 'Contacts',
+          ),
         ],
       ),
     );
@@ -320,6 +503,8 @@ class KeypadPage extends StatelessWidget {
     required this.onBackspace,
     required this.onClear,
     required this.onCall,
+    required this.suggestions,
+    required this.onPickSuggestion,
   });
 
   final String digits;
@@ -327,6 +512,8 @@ class KeypadPage extends StatelessWidget {
   final VoidCallback onBackspace;
   final VoidCallback onClear;
   final VoidCallback onCall;
+  final List<ContactEntry> suggestions;
+  final ValueChanged<ContactEntry> onPickSuggestion;
 
   @override
   Widget build(BuildContext context) {
@@ -361,6 +548,20 @@ class KeypadPage extends StatelessWidget {
             ),
           ),
         ),
+        for (final c in suggestions)
+          ListTile(
+            dense: true,
+            contentPadding: const EdgeInsets.symmetric(horizontal: 28),
+            leading: CircleAvatar(
+              backgroundColor: Palette.key,
+              foregroundColor: Palette.ink,
+              child: Text(initialsOf(c.name)),
+            ),
+            title: Text(c.name),
+            subtitle: Text(c.number),
+            trailing: const Icon(Icons.call_outlined, color: Palette.accept),
+            onTap: () => onPickSuggestion(c),
+          ),
         DialPad(onKey: onDigit),
         const SizedBox(height: 20),
         Row(
@@ -506,6 +707,9 @@ class RecentsPage extends StatefulWidget {
     required this.onSimulateIncoming,
     required this.autoAi,
     required this.onAutoAiChanged,
+    required this.permissionDenied,
+    required this.onAllowAccess,
+    required this.onRefresh,
   });
 
   final List<CallRecord> calls;
@@ -513,13 +717,16 @@ class RecentsPage extends StatefulWidget {
   final ValueChanged<String> onSimulateIncoming;
   final bool autoAi;
   final ValueChanged<bool> onAutoAiChanged;
+  final bool permissionDenied;
+  final VoidCallback onAllowAccess;
+  final Future<void> Function() onRefresh;
 
   @override
   State<RecentsPage> createState() => _RecentsPageState();
 }
 
 class _RecentsPageState extends State<RecentsPage> {
-  bool _missedOnly = false;
+  CallFilter _filter = CallFilter.all;
 
   void _showSummary(BuildContext context, CallRecord r) {
     showModalBottomSheet<void>(
@@ -583,9 +790,14 @@ class _RecentsPageState extends State<RecentsPage> {
 
   @override
   Widget build(BuildContext context) {
-    final items = _missedOnly
-        ? widget.calls.where((c) => c.type == CallType.missed).toList()
-        : widget.calls;
+    final items = widget.calls
+        .where((c) => switch (_filter) {
+              CallFilter.all => true,
+              CallFilter.missed => c.type == CallType.missed,
+              CallFilter.dialed => c.type == CallType.outgoing,
+              CallFilter.received => c.type == CallType.incoming,
+            })
+        .toList();
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -632,36 +844,49 @@ class _RecentsPageState extends State<RecentsPage> {
           child: Wrap(
             spacing: 8,
             children: [
-              ChoiceChip(
-                label: const Text('All'),
-                selected: !_missedOnly,
-                onSelected: (_) => setState(() => _missedOnly = false),
-              ),
-              ChoiceChip(
-                label: const Text('Missed'),
-                selected: _missedOnly,
-                onSelected: (_) => setState(() => _missedOnly = true),
-              ),
+              for (final f in CallFilter.values)
+                ChoiceChip(
+                  label: Text(f.label),
+                  selected: _filter == f,
+                  onSelected: (_) => setState(() => _filter = f),
+                ),
             ],
           ),
         ),
         Expanded(
-          child: items.isEmpty
-              ? const Center(
-                  child: Text(
-                    'No missed calls',
-                    style: TextStyle(color: Palette.inkSoft, fontSize: 16),
-                  ),
+          child: widget.permissionDenied
+              ? _AccessPrompt(
+                  message:
+                      'Allow access to your call history to see dialed, received and missed calls here.',
+                  onAllow: widget.onAllowAccess,
                 )
-              : ListView.builder(
-                  itemCount: items.length,
-                  itemBuilder: (context, i) => _CallTile(
-                    record: items[i],
-                    onCall: () => widget.onCall(items[i]),
-                    onOpen: items[i].aiSummary == null
-                        ? () => widget.onCall(items[i])
-                        : () => _showSummary(context, items[i]),
-                  ),
+              : RefreshIndicator(
+                  onRefresh: widget.onRefresh,
+                  child: items.isEmpty
+                      ? ListView(
+                          physics: const AlwaysScrollableScrollPhysics(),
+                          children: const [
+                            SizedBox(height: 120),
+                            Center(
+                              child: Text(
+                                'No calls to show',
+                                style: TextStyle(
+                                    color: Palette.inkSoft, fontSize: 16),
+                              ),
+                            ),
+                          ],
+                        )
+                      : ListView.builder(
+                          physics: const AlwaysScrollableScrollPhysics(),
+                          itemCount: items.length,
+                          itemBuilder: (context, i) => _CallTile(
+                            record: items[i],
+                            onCall: () => widget.onCall(items[i]),
+                            onOpen: items[i].aiSummary == null
+                                ? () => widget.onCall(items[i])
+                                : () => _showSummary(context, items[i]),
+                          ),
+                        ),
                 ),
         ),
       ],
@@ -1119,6 +1344,160 @@ class _PulseRingState extends State<PulseRing>
           ],
         );
       },
+    );
+  }
+}
+
+
+// ─────────────────────────────────────────────────────────────
+// Contacts tab + permission prompt
+// ─────────────────────────────────────────────────────────────
+class _AccessPrompt extends StatelessWidget {
+  const _AccessPrompt({required this.message, required this.onAllow});
+
+  final String message;
+  final VoidCallback onAllow;
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(32),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(Icons.lock_outline, size: 40, color: Palette.inkSoft),
+            const SizedBox(height: 14),
+            Text(
+              message,
+              textAlign: TextAlign.center,
+              style: const TextStyle(fontSize: 16, height: 1.4),
+            ),
+            const SizedBox(height: 20),
+            FilledButton(
+              onPressed: onAllow,
+              style: FilledButton.styleFrom(backgroundColor: Palette.accept),
+              child: const Text('Allow access'),
+            ),
+            const SizedBox(height: 12),
+            const Text(
+              'If nothing happens, open Settings, Apps, Smart Dialer, Permissions.',
+              textAlign: TextAlign.center,
+              style: TextStyle(color: Palette.inkSoft, fontSize: 13),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class ContactsPage extends StatefulWidget {
+  const ContactsPage({
+    super.key,
+    required this.contacts,
+    required this.onCall,
+    required this.permissionDenied,
+    required this.onAllowAccess,
+  });
+
+  final List<ContactEntry> contacts;
+  final ValueChanged<ContactEntry> onCall;
+  final bool permissionDenied;
+  final VoidCallback onAllowAccess;
+
+  @override
+  State<ContactsPage> createState() => _ContactsPageState();
+}
+
+class _ContactsPageState extends State<ContactsPage> {
+  String _q = '';
+
+  @override
+  Widget build(BuildContext context) {
+    final q = _q.trim().toLowerCase();
+    final qd = _q.replaceAll(RegExp(r'\D'), '');
+    final items = widget.contacts
+        .where((c) =>
+            c.name.toLowerCase().contains(q) ||
+            (qd.isNotEmpty &&
+                c.number.replaceAll(RegExp(r'\D'), '').contains(qd)))
+        .toList();
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Padding(
+          padding: EdgeInsets.fromLTRB(24, 20, 24, 8),
+          child: Text(
+            'Contacts',
+            style: TextStyle(fontSize: 32, fontWeight: FontWeight.w600),
+          ),
+        ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(20, 4, 20, 8),
+          child: TextField(
+            onChanged: (v) => setState(() => _q = v),
+            decoration: InputDecoration(
+              hintText: 'Search name or number',
+              prefixIcon: const Icon(Icons.search),
+              filled: true,
+              fillColor: Palette.key,
+              contentPadding: const EdgeInsets.symmetric(vertical: 0),
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(28),
+                borderSide: BorderSide.none,
+              ),
+            ),
+          ),
+        ),
+        Expanded(
+          child: widget.permissionDenied && widget.contacts.isEmpty
+              ? _AccessPrompt(
+                  message: 'Allow access to your contacts to see names here.',
+                  onAllow: widget.onAllowAccess,
+                )
+              : items.isEmpty
+                  ? const Center(
+                      child: Text(
+                        'No contacts found',
+                        style: TextStyle(color: Palette.inkSoft, fontSize: 16),
+                      ),
+                    )
+                  : ListView.builder(
+                      itemCount: items.length,
+                      itemBuilder: (context, i) {
+                        final c = items[i];
+                        return ListTile(
+                          contentPadding:
+                              const EdgeInsets.symmetric(horizontal: 20),
+                          leading: CircleAvatar(
+                            radius: 22,
+                            backgroundColor: Palette.key,
+                            foregroundColor: Palette.ink,
+                            child: Text(
+                              initialsOf(c.name),
+                              style:
+                                  const TextStyle(fontWeight: FontWeight.w600),
+                            ),
+                          ),
+                          title: Text(c.name),
+                          subtitle: Text(
+                            c.number,
+                            style: const TextStyle(color: Palette.inkSoft),
+                          ),
+                          trailing: IconButton(
+                            tooltip: 'Call ${c.name}',
+                            color: Palette.accept,
+                            icon: const Icon(Icons.call_outlined),
+                            onPressed: () => widget.onCall(c),
+                          ),
+                          onTap: () => widget.onCall(c),
+                        );
+                      },
+                    ),
+        ),
+      ],
     );
   }
 }
