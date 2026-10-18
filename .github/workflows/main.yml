@@ -32,6 +32,167 @@ jobs:
           cp /tmp/pubspec.yaml pubspec.yaml
           rm -rf test
 
+      - name: Add Android permissions and native code
+        run: |
+          python3 - <<'PY'
+          p = 'android/app/src/main/AndroidManifest.xml'
+          s = open(p).read()
+          names = ['READ_CALL_LOG', 'READ_CONTACTS', 'CALL_PHONE']
+          perms = ''.join('    <uses-permission android:name="android.permission.%s"/>\n' % n for n in names)
+          s = s.replace('<application', perms + '    <application', 1)
+          s = s.replace('android:label="smart_dialer"', 'android:label="Smart Dialer"')
+          open(p, 'w').write(s)
+          PY
+          MA=$(find android/app/src/main -name 'MainActivity.*' | head -1)
+          DIR=$(dirname "$MA")
+          rm -f "$MA"
+          cat > "$DIR/MainActivity.kt" <<'KT'
+          package com.example.smart_dialer
+
+          import android.Manifest
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.net.Uri
+          import android.os.Build
+          import android.provider.CallLog
+          import android.provider.ContactsContract
+          import io.flutter.embedding.android.FlutterActivity
+          import io.flutter.embedding.engine.FlutterEngine
+          import io.flutter.plugin.common.MethodChannel
+
+          class MainActivity : FlutterActivity() {
+              private val channelName = "smart_dialer/native"
+              private val permRequestCode = 4721
+              private var pendingResult: MethodChannel.Result? = null
+
+              private val wanted = arrayOf(
+                  Manifest.permission.READ_CALL_LOG,
+                  Manifest.permission.READ_CONTACTS,
+                  Manifest.permission.CALL_PHONE
+              )
+
+              override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+                  super.configureFlutterEngine(flutterEngine)
+                  MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channelName)
+                      .setMethodCallHandler { call, result ->
+                          when (call.method) {
+                              "permissionStatus" -> result.success(permissionMap())
+                              "requestPermissions" -> requestAll(result)
+                              "getCallLog" -> result.success(readCallLog())
+                              "getContacts" -> result.success(readContacts())
+                              "call" -> placeCall(call.argument<String>("number") ?: "", result)
+                              else -> result.notImplemented()
+                          }
+                      }
+              }
+
+              private fun granted(p: String): Boolean {
+                  if (Build.VERSION.SDK_INT < 23) return true
+                  return checkSelfPermission(p) == PackageManager.PERMISSION_GRANTED
+              }
+
+              private fun permissionMap(): Map<String, Boolean> = mapOf(
+                  "log" to granted(Manifest.permission.READ_CALL_LOG),
+                  "contacts" to granted(Manifest.permission.READ_CONTACTS),
+                  "call" to granted(Manifest.permission.CALL_PHONE)
+              )
+
+              private fun requestAll(result: MethodChannel.Result) {
+                  val missing = wanted.filter { !granted(it) }
+                  if (missing.isEmpty()) {
+                      result.success(permissionMap())
+                      return
+                  }
+                  if (Build.VERSION.SDK_INT < 23) {
+                      result.success(permissionMap())
+                      return
+                  }
+                  pendingResult?.success(permissionMap())
+                  pendingResult = result
+                  requestPermissions(missing.toTypedArray(), permRequestCode)
+              }
+
+              override fun onRequestPermissionsResult(
+                  requestCode: Int,
+                  permissions: Array<out String>,
+                  grantResults: IntArray
+              ) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+                  if (requestCode == permRequestCode) {
+                      pendingResult?.success(permissionMap())
+                      pendingResult = null
+                  }
+              }
+
+              private fun readCallLog(): List<Map<String, Any?>> {
+                  val out = ArrayList<Map<String, Any?>>()
+                  if (!granted(Manifest.permission.READ_CALL_LOG)) return out
+                  val cols = arrayOf(
+                      CallLog.Calls.NUMBER,
+                      CallLog.Calls.CACHED_NAME,
+                      CallLog.Calls.TYPE,
+                      CallLog.Calls.DATE,
+                      CallLog.Calls.DURATION
+                  )
+                  contentResolver.query(
+                      CallLog.Calls.CONTENT_URI, cols, null, null,
+                      CallLog.Calls.DATE + " DESC"
+                  )?.use { c ->
+                      var n = 0
+                      while (c.moveToNext() && n < 500) {
+                          val row = HashMap<String, Any?>()
+                          row["number"] = c.getString(0) ?: ""
+                          row["name"] = c.getString(1) ?: ""
+                          row["type"] = c.getInt(2)
+                          row["date"] = c.getLong(3)
+                          row["duration"] = c.getLong(4)
+                          out.add(row)
+                          n++
+                      }
+                  }
+                  return out
+              }
+
+              private fun readContacts(): List<Map<String, Any?>> {
+                  val out = ArrayList<Map<String, Any?>>()
+                  if (!granted(Manifest.permission.READ_CONTACTS)) return out
+                  val cols = arrayOf(
+                      ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
+                      ContactsContract.CommonDataKinds.Phone.NUMBER
+                  )
+                  contentResolver.query(
+                      ContactsContract.CommonDataKinds.Phone.CONTENT_URI, cols, null, null,
+                      ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME + " ASC"
+                  )?.use { c ->
+                      while (c.moveToNext()) {
+                          val row = HashMap<String, Any?>()
+                          row["name"] = c.getString(0) ?: ""
+                          row["number"] = c.getString(1) ?: ""
+                          out.add(row)
+                      }
+                  }
+                  return out
+              }
+
+              @Suppress("MissingPermission")
+              private fun placeCall(number: String, result: MethodChannel.Result) {
+                  if (number.isBlank()) {
+                      result.error("EMPTY", "No number", null)
+                      return
+                  }
+                  try {
+                      val uri = Uri.fromParts("tel", number, null)
+                      val action = if (granted(Manifest.permission.CALL_PHONE))
+                          Intent.ACTION_CALL else Intent.ACTION_DIAL
+                      startActivity(Intent(action, uri))
+                      result.success(true)
+                  } catch (e: Exception) {
+                      result.error("CALL_FAILED", e.message, null)
+                  }
+              }
+          }
+          KT
+
       - run: flutter pub get
       - run: flutter build apk --release
       - run: flutter build web --release --base-href "/${{ github.event.repository.name }}/"
