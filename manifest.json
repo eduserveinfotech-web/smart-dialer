@@ -1,6 +1,6 @@
 {
-    "name": "smart_dialer",
-    "short_name": "smart_dialer",
+    "name": "EduServ Caller",
+    "short_name": "EduServ Caller",
     "start_url": ".",
     "display": "standalone",
     "background_color": "#0175C2",
