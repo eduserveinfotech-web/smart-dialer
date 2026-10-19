@@ -16,35 +16,37 @@ void main() {
 // Design tokens
 // ─────────────────────────────────────────────────────────────
 class Pal {
-  static const violet = Color(0xFF6C3BFF);
-  static const indigo = Color(0xFF3D5AFE);
-  static const magenta = Color(0xFFFF3D9A);
-  static const orange = Color(0xFFFF8A3D);
-  static const teal = Color(0xFF00C2A8);
-  static const sky = Color(0xFF29B6FF);
-  static const green = Color(0xFF18C964);
-  static const red = Color(0xFFFF3B4E);
-  static const bg = Color(0xFFF5F3FF);
-  static const ink = Color(0xFF1B1446);
-  static const soft = Color(0xFF6E6A8F);
+  // Names are kept from v1; values are now a calm, professional blue palette.
+  static const violet = Color(0xFF2563EB); // primary blue
+  static const indigo = Color(0xFF1E3A8A); // navy
+  static const magenta = Color(0xFF3B82F6); // light blue
+  static const orange = Color(0xFFF59E0B); // amber
+  static const teal = Color(0xFF0EA5A4);
+  static const sky = Color(0xFF38BDF8);
+  static const green = Color(0xFF16A34A);
+  static const red = Color(0xFFE11D48);
+  static const bg = Color(0xFFF2F5FB);
+  static const ink = Color(0xFF0F172A);
+  static const soft = Color(0xFF64748B);
+  static const line = Color(0xFFE5EAF3);
 
   static const brand = LinearGradient(
-    colors: [violet, magenta],
+    colors: [Color(0xFF2563EB), Color(0xFF1E3A8A)],
     begin: Alignment.topLeft,
     end: Alignment.bottomRight,
   );
   static const callBg = LinearGradient(
-    colors: [Color(0xFF160F3D), Color(0xFF4B2AA8), Color(0xFFC13584)],
+    colors: [Color(0xFF0B1630), Color(0xFF11265C), Color(0xFF1D4ED8)],
     begin: Alignment.topCenter,
     end: Alignment.bottomCenter,
   );
   static const avatars = <List<Color>>[
-    [violet, indigo],
-    [magenta, orange],
-    [teal, sky],
-    [orange, magenta],
-    [indigo, sky],
-    [green, teal],
+    [Color(0xFF2563EB), Color(0xFF1E3A8A)],
+    [Color(0xFF0EA5A4), Color(0xFF0F766E)],
+    [Color(0xFF6366F1), Color(0xFF3730A3)],
+    [Color(0xFF0284C7), Color(0xFF075985)],
+    [Color(0xFF475569), Color(0xFF1E293B)],
+    [Color(0xFF7C3AED), Color(0xFF4C1D95)],
   ];
 }
 
@@ -54,7 +56,7 @@ class DialerApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Smart Dialer',
+      title: 'EduServ Caller',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         useMaterial3: true,
@@ -139,26 +141,39 @@ class AppSettings {
   const AppSettings({
     this.isDialer = false,
     this.isCallerId = false,
-    this.silenceUnknown = false,
+    this.unknownPolicy = 'ring',
+    this.assistantMessage = '',
+    this.serverUrl = '',
     this.blocked = const [],
   });
   final bool isDialer;
   final bool isCallerId;
-  final bool silenceUnknown;
+  final String unknownPolicy; // ring | silence | decline
+  final String assistantMessage;
+  final String serverUrl;
   final List<String> blocked;
 
-  AppSettings copyWith({bool? silenceUnknown, List<String>? blocked}) =>
+  AppSettings copyWith({
+    String? unknownPolicy,
+    String? assistantMessage,
+    String? serverUrl,
+    List<String>? blocked,
+  }) =>
       AppSettings(
         isDialer: isDialer,
         isCallerId: isCallerId,
-        silenceUnknown: silenceUnknown ?? this.silenceUnknown,
+        unknownPolicy: unknownPolicy ?? this.unknownPolicy,
+        assistantMessage: assistantMessage ?? this.assistantMessage,
+        serverUrl: serverUrl ?? this.serverUrl,
         blocked: blocked ?? this.blocked,
       );
 
   factory AppSettings.fromMap(Map<String, dynamic> m) => AppSettings(
         isDialer: m['isDialer'] == true,
         isCallerId: m['isCallerId'] == true,
-        silenceUnknown: m['silenceUnknown'] == true,
+        unknownPolicy: (m['unknownPolicy'] as String?) ?? 'ring',
+        assistantMessage: (m['assistantMessage'] as String?) ?? '',
+        serverUrl: (m['serverUrl'] as String?) ?? '',
         blocked: ((m['blocked'] as List?) ?? const [])
             .map((e) => e.toString())
             .toList(),
@@ -204,6 +219,134 @@ CallKind callKindFromAndroid(int t) => switch (t) {
       3 || 5 || 6 => CallKind.missed,
       _ => CallKind.incoming,
     };
+
+class LookupInfo {
+  const LookupInfo({required this.name, required this.spam, required this.reports});
+  final String name;
+  final bool spam;
+  final int reports;
+}
+
+String clockLabel(DateTime t) {
+  final h = t.hour % 12 == 0 ? 12 : t.hour % 12;
+  final m = t.minute.toString().padLeft(2, '0');
+  return '$h:$m ${t.hour < 12 ? 'AM' : 'PM'}';
+}
+
+String dayLabel(DateTime t) {
+  final now = DateTime.now();
+  final today = DateTime(now.year, now.month, now.day);
+  final diff = today.difference(DateTime(t.year, t.month, t.day)).inDays;
+  if (diff == 0) return 'TODAY';
+  if (diff == 1) return 'YESTERDAY';
+  const months = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'];
+  return '${t.day} ${months[t.month - 1]}';
+}
+
+bool isServiceAddress(String a) => RegExp(r'[A-Za-z]').hasMatch(a);
+
+/// App logo: handset on a blue tile with a green "verified" tick.
+class AppLogo extends StatelessWidget {
+  const AppLogo({super.key, this.size = 72});
+  final double size;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: size,
+      height: size,
+      child: Stack(
+        clipBehavior: Clip.none,
+        children: [
+          Container(
+            width: size,
+            height: size,
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(size * 0.28),
+              gradient: const LinearGradient(
+                colors: [Color(0xFF3B82F6), Color(0xFF1E3A8A)],
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+              ),
+              boxShadow: [
+                BoxShadow(
+                    color: Pal.violet.withValues(alpha: 0.35),
+                    blurRadius: size * 0.25,
+                    offset: Offset(0, size * 0.1)),
+              ],
+            ),
+            child: Icon(Icons.call, color: Colors.white, size: size * 0.52),
+          ),
+          Positioned(
+            right: -size * 0.06,
+            top: -size * 0.06,
+            child: Container(
+              width: size * 0.34,
+              height: size * 0.34,
+              decoration: BoxDecoration(
+                color: Pal.green,
+                shape: BoxShape.circle,
+                border: Border.all(color: Pal.bg, width: size * 0.04),
+              ),
+              child: Icon(Icons.check, color: Colors.white, size: size * 0.2),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _PillChip extends StatelessWidget {
+  const _PillChip({required this.label, required this.selected, required this.onTap});
+  final String label;
+  final bool selected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(right: 8),
+      child: GestureDetector(
+        onTap: onTap,
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 180),
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          alignment: Alignment.center,
+          decoration: BoxDecoration(
+            color: selected ? Pal.violet : Colors.white,
+            borderRadius: BorderRadius.circular(20),
+            border: Border.all(color: selected ? Pal.violet : Pal.line),
+          ),
+          child: Text(label,
+              style: TextStyle(
+                  fontWeight: FontWeight.w600,
+                  color: selected ? Colors.white : Pal.soft)),
+        ),
+      ),
+    );
+  }
+}
+
+class _Badge extends StatelessWidget {
+  const _Badge(this.text, this.color);
+  final String text;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      margin: const EdgeInsets.only(left: 6),
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+      decoration: BoxDecoration(
+          color: color.withValues(alpha: 0.12),
+          borderRadius: BorderRadius.circular(6)),
+      child: Text(text,
+          style: TextStyle(
+              color: color, fontSize: 10, fontWeight: FontWeight.w700)),
+    );
+  }
+}
 
 class GradientAvatar extends StatelessWidget {
   const GradientAvatar({
@@ -280,8 +423,17 @@ class NativeBridge {
     return AppSettings.fromMap(r ?? <String, dynamic>{});
   }
 
-  static Future<void> setSilenceUnknown(bool v) =>
-      _ch.invokeMethod<void>('setSilenceUnknown', {'value': v});
+  static Future<void> setUnknownPolicy(String v) =>
+      _ch.invokeMethod<void>('setUnknownPolicy', {'value': v});
+  static Future<void> setAssistantMessage(String v) =>
+      _ch.invokeMethod<void>('setAssistantMessage', {'value': v});
+  static Future<void> setServerUrl(String v) =>
+      _ch.invokeMethod<void>('setServerUrl', {'value': v});
+  static Future<Map<String, dynamic>?> lookup(String number) =>
+      _ch.invokeMapMethod<String, dynamic>('lookupNumber', {'number': number});
+  static Future<void> report(String number, String kind, [String name = '']) =>
+      _ch.invokeMethod<void>(
+          'reportNumber', {'number': number, 'kind': kind, 'name': name});
   static Future<void> setBlocked(List<String> n) =>
       _ch.invokeMethod<void>('setBlocked', {'numbers': n});
   static Future<void> requestDialer() =>
@@ -315,6 +467,9 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
   bool _contactsOk = true;
   bool _smsOk = true;
   bool _loading = false;
+  final Map<String, LookupInfo> _lookups = {};
+  final Set<String> _noInfo = {};
+  int _msgKind = 0;
 
   @override
   void initState() {
@@ -367,6 +522,11 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
       c('+91 99887 76655', CallKind.missed, const Duration(days: 2)),
       c('+91 542 255 0101', CallKind.outgoing, const Duration(days: 4)),
     ]);
+    _calls.insert(1, c('+91 70001 23456', CallKind.missed, const Duration(hours: 9)));
+    _lookups[numberKey('+91 70001 23456')] =
+        const LookupInfo(name: '', spam: true, reports: 27);
+    _lookups[numberKey('+91 80123 45678')] =
+        const LookupInfo(name: 'Blue Dart Delivery', spam: false, reports: 0);
     _threads = [
       SmsThread(
           threadId: 1,
@@ -459,6 +619,7 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
           _tab = 0;
         }
       });
+      unawaited(_lookupUnknown());
     } catch (_) {
       if (mounted) _toast('Could not load phone data');
     } finally {
@@ -509,6 +670,79 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
         .where((c) => c.number.replaceAll(RegExp(r'\D'), '').contains(d))
         .take(1)
         .toList();
+  }
+
+  Future<LookupInfo?> _lookup(String number) async {
+    final key = numberKey(number);
+    if (_lookups.containsKey(key)) return _lookups[key];
+    if (_noInfo.contains(key) || !NativeBridge.available) return null;
+    try {
+      final r = await NativeBridge.lookup(number);
+      if (r == null || r['found'] != true) {
+        _noInfo.add(key);
+        return null;
+      }
+      final info = LookupInfo(
+        name: (r['name'] as String?) ?? '',
+        spam: r['spam'] == true,
+        reports: (r['reports'] as num?)?.toInt() ?? 0,
+      );
+      _lookups[key] = info;
+      return info;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> _lookupUnknown() async {
+    var n = 0;
+    for (final c in List<CallRecord>.from(_calls)) {
+      if (c.name.isNotEmpty || !RegExp(r'\d').hasMatch(c.number)) continue;
+      final k = numberKey(c.number);
+      if (_lookups.containsKey(k) || _noInfo.contains(k)) continue;
+      if (++n > 20) break;
+      await _lookup(c.number);
+    }
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _lookupDialog(String number) async {
+    final info = await _lookup(number);
+    if (!mounted) return;
+    final configured = _settings.value.serverUrl.isNotEmpty || !NativeBridge.available;
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(number),
+        content: Text(info != null
+            ? '${info.name.isEmpty ? 'No name on record' : info.name}\n${info.spam ? 'Marked as spam by ${info.reports} people' : 'Not reported as spam'}'
+            : (configured
+                ? 'No information found for this number.'
+                : 'Set the Caller ID server in Settings to look up unknown numbers.')),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Close')),
+          FilledButton(
+            onPressed: () {
+              Navigator.pop(ctx);
+              _call(number, name: info?.name ?? '');
+            },
+            child: const Text('Call'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _reportSpam(CallRecord r) {
+    final cur = List<String>.from(_settings.value.blocked);
+    if (!cur.any((n) => numberKey(n) == numberKey(r.number))) {
+      cur.add(r.number);
+      _settings.value = _settings.value.copyWith(blocked: cur);
+      if (NativeBridge.available) NativeBridge.setBlocked(cur);
+    }
+    if (NativeBridge.available) NativeBridge.report(r.number, 'spam');
+    setState(() {});
+    _toast('Reported as spam and blocked');
   }
 
   Future<void> _openChat(String address, {SmsThread? thread}) async {
@@ -585,6 +819,7 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
     }
     _settings.value = _settings.value.copyWith(blocked: cur);
     if (NativeBridge.available) NativeBridge.setBlocked(cur);
+    setState(() {});
     _toast(blocked ? 'Number unblocked' : 'Number blocked');
   }
 
@@ -623,9 +858,22 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
           }
           await NativeBridge.requestCallerId();
         },
-        onSilence: (v) {
-          _settings.value = _settings.value.copyWith(silenceUnknown: v);
-          if (NativeBridge.available) NativeBridge.setSilenceUnknown(v);
+        onPolicy: (v) {
+          _settings.value = _settings.value.copyWith(unknownPolicy: v);
+          if (NativeBridge.available) NativeBridge.setUnknownPolicy(v);
+        },
+        onAssistantMessage: (v) {
+          _settings.value = _settings.value.copyWith(assistantMessage: v);
+          if (NativeBridge.available) NativeBridge.setAssistantMessage(v);
+        },
+        onServerUrl: (v) {
+          _settings.value = _settings.value.copyWith(serverUrl: v);
+          _lookups.clear();
+          _noInfo.clear();
+          if (NativeBridge.available) {
+            NativeBridge.setServerUrl(v);
+            _lookupUnknown();
+          }
         },
         onBlockedChanged: (list) {
           _settings.value = _settings.value.copyWith(blocked: list);
@@ -668,6 +916,8 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
                   onCall: (c) => _call(c.number, name: c.name),
                   onMessage: (c) => _openChat(c.number),
                   onBlock: (c) => _toggleBlock(c.number),
+                  lookups: _lookups,
+                  onReportSpam: _reportSpam,
                 ),
                 ContactsPage(
                   contacts: _contactRows,
@@ -675,6 +925,7 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
                   onAllow: () => _load(ask: true),
                   onCall: (c) => _call(c.number, name: c.name),
                   onMessage: (c) => _openChat(c.number),
+                  onLookup: _lookupDialog,
                 ),
                 MessagesPage(
                   threads: _threads,
@@ -684,6 +935,8 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
                   onRefresh: () => _load(),
                   onOpen: (t) => _openChat(t.address, thread: t),
                   onNew: _newMessage,
+                  kind: _msgKind,
+                  onKind: (k) => setState(() => _msgKind = k),
                 ),
               ],
             ),
@@ -709,15 +962,15 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
               label: 'Keypad'),
           NavigationDestination(
               icon: Icon(Icons.history),
-              selectedIcon: Icon(Icons.history, color: Pal.magenta),
+              selectedIcon: Icon(Icons.history, color: Pal.violet),
               label: 'Recents'),
           NavigationDestination(
               icon: Icon(Icons.people_outline),
-              selectedIcon: Icon(Icons.people, color: Pal.teal),
+              selectedIcon: Icon(Icons.people, color: Pal.violet),
               label: 'Contacts'),
           NavigationDestination(
               icon: Icon(Icons.chat_bubble_outline),
-              selectedIcon: Icon(Icons.chat_bubble, color: Pal.orange),
+              selectedIcon: Icon(Icons.chat_bubble, color: Pal.violet),
               label: 'Messages'),
         ],
       ),
@@ -757,15 +1010,20 @@ class KeypadPage extends StatelessWidget {
             padding: const EdgeInsets.symmetric(horizontal: 28),
             child: Center(
               child: digits.isEmpty
-                  ? ShaderMask(
-                      shaderCallback: (r) => Pal.brand.createShader(r),
-                      child: const Text(
-                        'Smart Dialer',
-                        style: TextStyle(
-                            fontSize: 30,
-                            fontWeight: FontWeight.w800,
-                            color: Colors.white),
-                      ),
+                  ? const Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        AppLogo(size: 84),
+                        SizedBox(height: 16),
+                        Text('EduServ Caller',
+                            style: TextStyle(
+                                fontSize: 26,
+                                fontWeight: FontWeight.w800,
+                                color: Pal.ink)),
+                        SizedBox(height: 4),
+                        Text('Caller ID  \u2022  Spam protection',
+                            style: TextStyle(color: Pal.soft, fontSize: 13)),
+                      ],
                     )
                   : FittedBox(
                       fit: BoxFit.scaleDown,
@@ -961,14 +1219,9 @@ class PageTitle extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          ShaderMask(
-            shaderCallback: (r) => Pal.brand.createShader(r),
-            child: Text(text,
-                style: const TextStyle(
-                    fontSize: 32,
-                    fontWeight: FontWeight.w800,
-                    color: Colors.white)),
-          ),
+          Text(text,
+              style: const TextStyle(
+                  fontSize: 30, fontWeight: FontWeight.w800, color: Pal.ink)),
           if (sub != null)
             Text(sub!, style: const TextStyle(color: Pal.soft, fontSize: 13)),
         ],
@@ -1010,7 +1263,7 @@ class AccessPrompt extends StatelessWidget {
             ),
             const SizedBox(height: 12),
             const Text(
-              'If nothing happens: Settings > Apps > Smart Dialer > Permissions. On some phones also tap the 3 dots and choose "Allow restricted settings".',
+              'If nothing happens: Settings > Apps > EduServ Caller > Permissions. On some phones also tap the 3 dots and choose "Allow restricted settings".',
               textAlign: TextAlign.center,
               style: TextStyle(color: Pal.soft, fontSize: 12),
             ),
@@ -1035,6 +1288,8 @@ class RecentsPage extends StatefulWidget {
     required this.onCall,
     required this.onMessage,
     required this.onBlock,
+    required this.lookups,
+    required this.onReportSpam,
   });
 
   final List<CallRecord> calls;
@@ -1045,6 +1300,8 @@ class RecentsPage extends StatefulWidget {
   final ValueChanged<CallRecord> onCall;
   final ValueChanged<CallRecord> onMessage;
   final ValueChanged<CallRecord> onBlock;
+  final Map<String, LookupInfo> lookups;
+  final ValueChanged<CallRecord> onReportSpam;
 
   @override
   State<RecentsPage> createState() => _RecentsPageState();
@@ -1086,6 +1343,14 @@ class _RecentsPageState extends State<RecentsPage> {
               },
             ),
             ListTile(
+              leading: const Icon(Icons.report, color: Pal.red),
+              title: const Text('Report as spam'),
+              onTap: () {
+                Navigator.pop(ctx);
+                widget.onReportSpam(r);
+              },
+            ),
+            ListTile(
               leading: Icon(isBlocked ? Icons.lock_open : Icons.block,
                   color: Pal.red),
               title: Text(isBlocked ? 'Unblock number' : 'Block number'),
@@ -1110,6 +1375,17 @@ class _RecentsPageState extends State<RecentsPage> {
               CallFilter.received => c.kind == CallKind.incoming,
             })
         .toList();
+    final rows = <Object>[];
+    String? lastDay;
+    for (final c in items) {
+      final d = dayLabel(c.time);
+      if (d != lastDay) {
+        rows.add(d);
+        lastDay = d;
+      }
+      rows.add(c);
+    }
+    final blockedKeys = widget.blocked.value.blocked.map(numberKey).toSet();
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -1122,26 +1398,10 @@ class _RecentsPageState extends State<RecentsPage> {
             padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 6),
             children: [
               for (final f in CallFilter.values)
-                Padding(
-                  padding: const EdgeInsets.only(right: 8),
-                  child: GestureDetector(
-                    onTap: () => setState(() => _filter = f),
-                    child: AnimatedContainer(
-                      duration: const Duration(milliseconds: 180),
-                      padding: const EdgeInsets.symmetric(horizontal: 16),
-                      alignment: Alignment.center,
-                      decoration: BoxDecoration(
-                        gradient: _filter == f ? Pal.brand : null,
-                        color: _filter == f ? null : Colors.white,
-                        borderRadius: BorderRadius.circular(20),
-                      ),
-                      child: Text(f.label,
-                          style: TextStyle(
-                              fontWeight: FontWeight.w600,
-                              color: _filter == f ? Colors.white : Pal.soft)),
-                    ),
-                  ),
-                ),
+                _PillChip(
+                    label: f.label,
+                    selected: _filter == f,
+                    onTap: () => setState(() => _filter = f)),
             ],
           ),
         ),
@@ -1165,13 +1425,31 @@ class _RecentsPageState extends State<RecentsPage> {
                         )
                       : ListView.builder(
                           physics: const AlwaysScrollableScrollPhysics(),
-                          padding: const EdgeInsets.fromLTRB(16, 4, 16, 12),
-                          itemCount: items.length,
-                          itemBuilder: (context, i) => _CallTile(
-                            record: items[i],
-                            onTap: () => widget.onCall(items[i]),
-                            onLong: () => _sheet(items[i]),
-                          ),
+                          padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+                          itemCount: rows.length,
+                          itemBuilder: (context, i) {
+                            final r = rows[i];
+                            if (r is String) {
+                              return Padding(
+                                padding: const EdgeInsets.fromLTRB(6, 14, 0, 4),
+                                child: Text(r,
+                                    style: const TextStyle(
+                                        color: Pal.soft,
+                                        fontWeight: FontWeight.w700,
+                                        fontSize: 12,
+                                        letterSpacing: 0.6)),
+                              );
+                            }
+                            final c = r as CallRecord;
+                            final k = numberKey(c.number);
+                            return _CallTile(
+                              record: c,
+                              lookup: widget.lookups[k],
+                              blocked: blockedKeys.contains(k),
+                              onTap: () => widget.onCall(c),
+                              onLong: () => _sheet(c),
+                            );
+                          },
                         ),
                 ),
         ),
@@ -1181,50 +1459,67 @@ class _RecentsPageState extends State<RecentsPage> {
 }
 
 class _CallTile extends StatelessWidget {
-  const _CallTile(
-      {required this.record, required this.onTap, required this.onLong});
+  const _CallTile({
+    required this.record,
+    required this.lookup,
+    required this.blocked,
+    required this.onTap,
+    required this.onLong,
+  });
   final CallRecord record;
+  final LookupInfo? lookup;
+  final bool blocked;
   final VoidCallback onTap;
   final VoidCallback onLong;
 
   @override
   Widget build(BuildContext context) {
+    final shown = record.name.isNotEmpty ? record.name : (lookup?.name ?? '');
+    final spam = lookup?.spam == true;
     final missed = record.kind == CallKind.missed;
-    final title = record.name.isEmpty ? record.number : record.name;
+    final title = shown.isEmpty ? record.number : shown;
     final (icon, color) = switch (record.kind) {
       CallKind.incoming => (Icons.call_received, Pal.green),
-      CallKind.outgoing => (Icons.call_made, Pal.indigo),
+      CallKind.outgoing => (Icons.call_made, Pal.violet),
       CallKind.missed => (Icons.call_missed, Pal.red),
     };
     return Container(
       margin: const EdgeInsets.symmetric(vertical: 4),
       decoration: BoxDecoration(
         color: Colors.white,
-        borderRadius: BorderRadius.circular(18),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: Pal.line),
       ),
       child: ListTile(
         onTap: onTap,
         onLongPress: onLong,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
-        leading: GradientAvatar(name: record.name, seed: record.number),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        leading: spam
+            ? CircleAvatar(
+                radius: 24,
+                backgroundColor: Pal.red.withValues(alpha: 0.12),
+                child: const Icon(Icons.gpp_maybe, color: Pal.red))
+            : GradientAvatar(name: shown, seed: record.number),
         title: Text(title,
             style: TextStyle(
                 fontWeight: FontWeight.w600,
-                color: missed ? Pal.red : Pal.ink)),
+                color: (missed || spam) ? Pal.red : Pal.ink)),
         subtitle: Row(
           children: [
             Icon(icon, size: 15, color: color),
             const SizedBox(width: 5),
             Flexible(
               child: Text(
-                record.name.isEmpty ? 'Unknown' : record.number,
+                shown.isEmpty ? (spam ? 'Suspected spam' : 'Unknown') : record.number,
                 overflow: TextOverflow.ellipsis,
                 style: const TextStyle(color: Pal.soft),
               ),
             ),
+            if (spam && shown.isNotEmpty) const _Badge('SPAM', Pal.red),
+            if (blocked) const _Badge('BLOCKED', Pal.soft),
           ],
         ),
-        trailing: Text(whenLabel(record.time),
+        trailing: Text(clockLabel(record.time),
             style: const TextStyle(color: Pal.soft, fontSize: 12)),
       ),
     );
@@ -1242,6 +1537,7 @@ class ContactsPage extends StatefulWidget {
     required this.onAllow,
     required this.onCall,
     required this.onMessage,
+    required this.onLookup,
   });
 
   final List<ContactEntry> contacts;
@@ -1249,6 +1545,7 @@ class ContactsPage extends StatefulWidget {
   final VoidCallback onAllow;
   final ValueChanged<ContactEntry> onCall;
   final ValueChanged<ContactEntry> onMessage;
+  final ValueChanged<String> onLookup;
 
   @override
   State<ContactsPage> createState() => _ContactsPageState();
@@ -1294,9 +1591,17 @@ class _ContactsPageState extends State<ContactsPage> {
                   message: 'Allow access to your contacts to see names here.',
                   onAllow: widget.onAllow)
               : items.isEmpty
-                  ? const Center(
-                      child: Text('No contacts found',
-                          style: TextStyle(color: Pal.soft)))
+                  ? Center(
+                      child: qd.length >= 6
+                          ? FilledButton.icon(
+                              onPressed: () => widget.onLookup(_q.trim()),
+                              style: FilledButton.styleFrom(
+                                  backgroundColor: Pal.violet),
+                              icon: const Icon(Icons.search),
+                              label: Text('Look up ${_q.trim()}'),
+                            )
+                          : const Text('No contacts found',
+                              style: TextStyle(color: Pal.soft)))
                   : ListView.builder(
                       padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
                       itemCount: items.length,
@@ -1356,6 +1661,8 @@ class MessagesPage extends StatelessWidget {
     required this.onRefresh,
     required this.onOpen,
     required this.onNew,
+    required this.kind,
+    required this.onKind,
   });
 
   final List<SmsThread> threads;
@@ -1365,15 +1672,36 @@ class MessagesPage extends StatelessWidget {
   final Future<void> Function() onRefresh;
   final ValueChanged<SmsThread> onOpen;
   final VoidCallback onNew;
+  final int kind; // 0 all, 1 personal, 2 services
+  final ValueChanged<int> onKind;
 
   @override
   Widget build(BuildContext context) {
+    final threads = this
+        .threads
+        .where((t) => kind == 0 || (kind == 2) == isServiceAddress(t.address))
+        .toList();
     return Stack(
       children: [
         Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             PageTitle('Messages', sub: '${threads.length} conversations'),
+            SizedBox(
+              height: 46,
+              child: ListView(
+                scrollDirection: Axis.horizontal,
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 20, vertical: 6),
+                children: [
+                  for (var i = 0; i < 3; i++)
+                    _PillChip(
+                        label: const ['All', 'Personal', 'Services'][i],
+                        selected: kind == i,
+                        onTap: () => onKind(i)),
+                ],
+              ),
+            ),
             Expanded(
               child: permissionDenied
                   ? AccessPrompt(
@@ -1669,7 +1997,9 @@ class SettingsPage extends StatefulWidget {
     required this.settings,
     required this.onRequestDialer,
     required this.onRequestCallerId,
-    required this.onSilence,
+    required this.onPolicy,
+    required this.onAssistantMessage,
+    required this.onServerUrl,
     required this.onBlockedChanged,
     required this.onOpenAppSettings,
     required this.onPreviewIncoming,
@@ -1680,7 +2010,9 @@ class SettingsPage extends StatefulWidget {
   final ValueNotifier<AppSettings> settings;
   final Future<void> Function() onRequestDialer;
   final Future<void> Function() onRequestCallerId;
-  final ValueChanged<bool> onSilence;
+  final ValueChanged<String> onPolicy;
+  final ValueChanged<String> onAssistantMessage;
+  final ValueChanged<String> onServerUrl;
   final ValueChanged<List<String>> onBlockedChanged;
   final VoidCallback onOpenAppSettings;
   final VoidCallback onPreviewIncoming;
@@ -1693,18 +2025,28 @@ class SettingsPage extends StatefulWidget {
 
 class _SettingsPageState extends State<SettingsPage>
     with WidgetsBindingObserver {
-  final _ctl = TextEditingController();
+  final _block = TextEditingController();
+  late final TextEditingController _msg;
+  late final TextEditingController _url;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    final s = widget.settings.value;
+    _msg = TextEditingController(
+        text: s.assistantMessage.isNotEmpty
+            ? s.assistantMessage
+            : 'Hello, this is the EduServ Caller assistant. I cannot take your call right now. Please send your name and reason by SMS and I will get back to you.');
+    _url = TextEditingController(text: s.serverUrl);
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    _ctl.dispose();
+    _block.dispose();
+    _msg.dispose();
+    _url.dispose();
     super.dispose();
   }
 
@@ -1717,13 +2059,33 @@ class _SettingsPageState extends State<SettingsPage>
         margin: const EdgeInsets.symmetric(vertical: 6),
         padding: const EdgeInsets.all(16),
         decoration: BoxDecoration(
-            color: Colors.white, borderRadius: BorderRadius.circular(20)),
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(color: Pal.line),
+        ),
         child: child,
+      );
+
+  Widget _heading(String t, [String? sub]) => Padding(
+        padding: const EdgeInsets.only(bottom: 8),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(t,
+                style:
+                    const TextStyle(fontWeight: FontWeight.w700, fontSize: 16)),
+            if (sub != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 2),
+                child: Text(sub,
+                    style: const TextStyle(color: Pal.soft, fontSize: 12.5)),
+              ),
+          ],
+        ),
       );
 
   Widget _roleCard({
     required IconData icon,
-    required List<Color> colors,
     required String title,
     required String body,
     required bool on,
@@ -1733,11 +2095,10 @@ class _SettingsPageState extends State<SettingsPage>
       child: Row(
         children: [
           Container(
-            width: 48,
-            height: 48,
+            width: 46,
+            height: 46,
             decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                gradient: LinearGradient(colors: colors)),
+                borderRadius: BorderRadius.circular(14), gradient: Pal.brand),
             child: Icon(icon, color: Colors.white),
           ),
           const SizedBox(width: 14),
@@ -1747,10 +2108,10 @@ class _SettingsPageState extends State<SettingsPage>
               children: [
                 Text(title,
                     style: const TextStyle(
-                        fontWeight: FontWeight.w700, fontSize: 16)),
+                        fontWeight: FontWeight.w700, fontSize: 15.5)),
                 const SizedBox(height: 2),
                 Text(body,
-                    style: const TextStyle(color: Pal.soft, fontSize: 13)),
+                    style: const TextStyle(color: Pal.soft, fontSize: 12.5)),
               ],
             ),
           ),
@@ -1767,6 +2128,22 @@ class _SettingsPageState extends State<SettingsPage>
     );
   }
 
+  Widget _policyTile(AppSettings s, String value, IconData icon, String title,
+      String sub) {
+    final on = s.unknownPolicy == value;
+    return ListTile(
+      contentPadding: EdgeInsets.zero,
+      onTap: () => widget.onPolicy(value),
+      leading: Icon(icon, color: on ? Pal.violet : Pal.soft),
+      title: Text(title,
+          style: TextStyle(
+              fontWeight: on ? FontWeight.w700 : FontWeight.w500)),
+      subtitle: Text(sub, style: const TextStyle(fontSize: 12.5)),
+      trailing: Icon(on ? Icons.radio_button_checked : Icons.radio_button_off,
+          color: on ? Pal.violet : Pal.soft),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -1780,47 +2157,107 @@ class _SettingsPageState extends State<SettingsPage>
         builder: (context, s, _) => ListView(
           padding: const EdgeInsets.fromLTRB(16, 4, 16, 32),
           children: [
+            _card(
+              child: const Row(
+                children: [
+                  AppLogo(size: 52),
+                  SizedBox(width: 14),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text('EduServ Caller',
+                            style: TextStyle(
+                                fontWeight: FontWeight.w800, fontSize: 18)),
+                        Text('Caller ID  \u2022  Spam protection  \u2022  SMS',
+                            style: TextStyle(color: Pal.soft, fontSize: 12.5)),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
             _roleCard(
               icon: Icons.phone_in_talk,
-              colors: const [Pal.green, Pal.teal],
               title: 'Default phone app',
-              body: 'Calls open in Smart Dialer, full screen.',
+              body: 'Calls open in EduServ Caller, full screen.',
               on: s.isDialer,
               onTap: () => widget.onRequestDialer(),
             ),
             _roleCard(
               icon: Icons.shield,
-              colors: const [Pal.violet, Pal.indigo],
               title: 'Caller ID & spam app',
-              body: 'Lets Smart Dialer silence or block callers.',
+              body: 'Needed for the unknown-number options below.',
               on: s.isCallerId,
               onTap: () => widget.onRequestCallerId(),
             ),
             _card(
-              child: SwitchListTile(
-                contentPadding: EdgeInsets.zero,
-                title: const Text('Silence unknown callers',
-                    style: TextStyle(fontWeight: FontWeight.w700)),
-                subtitle: const Text(
-                    'Numbers not in your contacts ring silently. They still show in Recents.'),
-                value: s.silenceUnknown,
-                activeTrackColor: Pal.violet,
-                onChanged: widget.onSilence,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  _heading('Unknown & unsaved numbers',
+                      'What should happen when a number not in your contacts calls?'),
+                  _policyTile(s, 'ring', Icons.notifications_active,
+                      'Ring normally', 'Show the call as usual'),
+                  _policyTile(s, 'silence', Icons.notifications_off,
+                      'Silence', 'No ringing. It still shows in Recents'),
+                  _policyTile(s, 'decline', Icons.sms,
+                      'Decline and send my message',
+                      'Call is declined and this SMS is sent (once per 6 hours per number)'),
+                  if (s.unknownPolicy == 'decline')
+                    Padding(
+                      padding: const EdgeInsets.only(top: 8),
+                      child: TextField(
+                        controller: _msg,
+                        minLines: 2,
+                        maxLines: 4,
+                        onChanged: widget.onAssistantMessage,
+                        decoration: const InputDecoration(
+                            labelText: 'Message to send',
+                            border: OutlineInputBorder()),
+                      ),
+                    ),
+                ],
               ),
             ),
             _card(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  const Text('Blocked numbers',
-                      style:
-                          TextStyle(fontWeight: FontWeight.w700, fontSize: 16)),
-                  const SizedBox(height: 8),
+                  _heading('Caller ID server',
+                      'Shows names and spam warnings for unknown numbers. Paste the link of your caller_api.php.'),
                   Row(
                     children: [
                       Expanded(
                         child: TextField(
-                          controller: _ctl,
+                          controller: _url,
+                          keyboardType: TextInputType.url,
+                          decoration: const InputDecoration(
+                              hintText: 'https://yourserver.com/caller_api.php'),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      FilledButton(
+                        onPressed: () => widget.onServerUrl(_url.text.trim()),
+                        style: FilledButton.styleFrom(
+                            backgroundColor: Pal.violet),
+                        child: const Text('Save'),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+            _card(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  _heading('Blocked numbers'),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: TextField(
+                          controller: _block,
                           keyboardType: TextInputType.phone,
                           decoration: const InputDecoration(
                               hintText: 'Add a number to block'),
@@ -1829,10 +2266,10 @@ class _SettingsPageState extends State<SettingsPage>
                       IconButton(
                         icon: const Icon(Icons.add_circle, color: Pal.violet),
                         onPressed: () {
-                          final n = _ctl.text.trim();
+                          final n = _block.text.trim();
                           if (n.isEmpty) return;
                           widget.onBlockedChanged([...s.blocked, n]);
-                          _ctl.clear();
+                          _block.clear();
                         },
                       ),
                     ],
@@ -1862,10 +2299,7 @@ class _SettingsPageState extends State<SettingsPage>
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  const Text('Preview call screens',
-                      style:
-                          TextStyle(fontWeight: FontWeight.w700, fontSize: 16)),
-                  const SizedBox(height: 10),
+                  _heading('Preview call screens'),
                   Wrap(
                     spacing: 8,
                     children: [
@@ -1907,6 +2341,7 @@ class CallInfo {
     this.connectMs = 0,
     this.muted = false,
     this.speaker = false,
+    this.spam = false,
   });
   final String state; // idle, ringing, dialing, active, holding, ended
   final String number;
@@ -1914,6 +2349,7 @@ class CallInfo {
   final int connectMs;
   final bool muted;
   final bool speaker;
+  final bool spam;
 
   CallInfo copyWith(
           {String? state, int? connectMs, bool? muted, bool? speaker}) =>
@@ -1924,6 +2360,7 @@ class CallInfo {
         connectMs: connectMs ?? this.connectMs,
         muted: muted ?? this.muted,
         speaker: speaker ?? this.speaker,
+        spam: spam,
       );
 
   factory CallInfo.fromMap(Map<String, dynamic> m, CallInfo prev) {
@@ -1941,6 +2378,7 @@ class CallInfo {
       connectMs: (m['connectTime'] as num?)?.toInt() ?? 0,
       muted: m['muted'] == true,
       speaker: m['speaker'] == true,
+      spam: m['spam'] == true,
     );
   }
 }
@@ -2164,16 +2602,19 @@ class _InCallScreenState extends State<InCallScreen> {
                           color: Colors.white70,
                           fontSize: 17,
                           letterSpacing: 0.4)),
-                  if (unknown && i.state != 'idle')
+                  if ((unknown || i.spam) && i.state != 'idle')
                     Container(
                       margin: const EdgeInsets.only(top: 10),
                       padding: const EdgeInsets.symmetric(
                           horizontal: 12, vertical: 4),
                       decoration: BoxDecoration(
-                          color: Pal.orange.withValues(alpha: 0.25),
+                          color: i.spam
+                              ? Pal.red.withValues(alpha: 0.6)
+                              : Pal.orange.withValues(alpha: 0.25),
                           borderRadius: BorderRadius.circular(14)),
-                      child: const Text('Unknown caller',
-                          style: TextStyle(color: Colors.white, fontSize: 12)),
+                      child: Text(i.spam ? 'Suspected spam' : 'Unknown caller',
+                          style: const TextStyle(
+                              color: Colors.white, fontSize: 12)),
                     ),
                   Expanded(
                     child: _pad
