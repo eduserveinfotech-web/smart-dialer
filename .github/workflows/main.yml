@@ -1,4 +1,4 @@
-name: Build APK and Web
+name: Build EduServ Caller (APK and Web)
 
 on:
   push:
@@ -23,6 +23,12 @@ jobs:
         with:
           channel: stable
 
+      - name: Restore signing key
+        uses: actions/cache@v4
+        with:
+          path: eduserv.jks
+          key: eduserv-signing-key-v1
+
       - name: Generate platform folders
         run: |
           cp lib/main.dart /tmp/main.dart
@@ -31,18 +37,19 @@ jobs:
           cp /tmp/main.dart lib/main.dart
           cp /tmp/pubspec.yaml pubspec.yaml
           rm -rf test
+          sed -i 's/smart_dialer/EduServ Caller/g' web/index.html web/manifest.json
 
-      - name: Add Android permissions, services and native code
+      - name: Add Android permissions, services, icon and native code
         run: |
           python3 - <<'PY'
 
           p = 'android/app/src/main/AndroidManifest.xml'
           s = open(p).read()
-          names = ['READ_CALL_LOG', 'READ_CONTACTS', 'CALL_PHONE', 'READ_PHONE_STATE',
+          names = ['INTERNET', 'READ_CALL_LOG', 'READ_CONTACTS', 'CALL_PHONE', 'READ_PHONE_STATE',
                    'READ_SMS', 'SEND_SMS', 'POST_NOTIFICATIONS', 'USE_FULL_SCREEN_INTENT']
           perms = ''.join('    <uses-permission android:name="android.permission.%s"/>\n' % n for n in names)
           s = s.replace('<application', perms + '    <application', 1)
-          s = s.replace('android:label="smart_dialer"', 'android:label="Smart Dialer"')
+          s = s.replace('android:label="smart_dialer"', 'android:label="EduServ Caller"')
 
           main_filters = """
                       <intent-filter>
@@ -113,6 +120,10 @@ jobs:
           import android.provider.ContactsContract
 
           object Util {
+              const val DEFAULT_MSG =
+                  "Hello, this is the EduServ Caller assistant. I cannot take your call right now. " +
+                      "Please send your name and reason by SMS and I will get back to you."
+
               fun has(ctx: Context, perm: String): Boolean {
                   if (Build.VERSION.SDK_INT < 23) return true
                   return ctx.checkSelfPermission(perm) == PackageManager.PERMISSION_GRANTED
@@ -140,6 +151,69 @@ jobs:
               fun prefs(ctx: Context) = ctx.getSharedPreferences("smart_dialer", Context.MODE_PRIVATE)
           }
           EOF_UTIL
+          cat > "$DIR/Lookup.kt" <<'EOF_LOOKUP'
+          package com.example.smart_dialer
+
+          import android.content.Context
+          import org.json.JSONObject
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import java.net.URLEncoder
+
+          /** Talks to the optional caller_api.php server. All calls block: use a background thread. */
+          object Lookup {
+              private fun enc(s: String): String = URLEncoder.encode(s, "UTF-8")
+
+              fun serverUrl(ctx: Context): String =
+                  (Util.prefs(ctx).getString("server_url", "") ?: "").trim()
+
+              fun find(ctx: Context, number: String): Map<String, Any?>? {
+                  val base = serverUrl(ctx)
+                  if (base.isEmpty() || number.isBlank()) return null
+                  return try {
+                      val sep = if (base.contains("?")) "&" else "?"
+                      val url = URL(base + sep + "action=lookup&number=" + enc(number))
+                      val c = url.openConnection() as HttpURLConnection
+                      c.connectTimeout = 2500
+                      c.readTimeout = 2500
+                      c.requestMethod = "GET"
+                      val text = c.inputStream.bufferedReader().use { it.readText() }
+                      c.disconnect()
+                      val j = JSONObject(text)
+                      if (!j.optBoolean("found", false)) {
+                          null
+                      } else {
+                          val m = HashMap<String, Any?>()
+                          m["found"] = true
+                          m["name"] = j.optString("name", "")
+                          m["spam"] = j.optBoolean("spam", false)
+                          m["reports"] = j.optInt("reports", 0)
+                          m
+                      }
+                  } catch (e: Exception) {
+                      null
+                  }
+              }
+
+              fun report(ctx: Context, number: String, kind: String, name: String) {
+                  val base = serverUrl(ctx)
+                  if (base.isEmpty()) return
+                  try {
+                      val c = URL(base).openConnection() as HttpURLConnection
+                      c.connectTimeout = 2500
+                      c.readTimeout = 2500
+                      c.requestMethod = "POST"
+                      c.doOutput = true
+                      val body = "action=report&number=" + enc(number) + "&kind=" + enc(kind) +
+                          "&name=" + enc(name)
+                      c.outputStream.use { it.write(body.toByteArray()) }
+                      c.responseCode
+                      c.disconnect()
+                  } catch (e: Exception) {
+                  }
+              }
+          }
+          EOF_LOOKUP
           cat > "$DIR/CallActionReceiver.kt" <<'EOF_CALLACTIONRECEIVER'
           package com.example.smart_dialer
 
@@ -198,35 +272,63 @@ jobs:
           cat > "$DIR/SmartScreeningService.kt" <<'EOF_SMARTSCREENINGSERVICE'
           package com.example.smart_dialer
 
+          import android.Manifest
           import android.annotation.SuppressLint
           import android.os.Build
           import android.telecom.Call
           import android.telecom.CallScreeningService
+          import android.telephony.SmsManager
 
-          @SuppressLint("NewApi")
+          @SuppressLint("NewApi", "MissingPermission")
           class SmartScreeningService : CallScreeningService() {
+
               override fun onScreenCall(details: Call.Details) {
                   val number = details.handle?.schemeSpecificPart ?: ""
                   val prefs = Util.prefs(this)
                   val blocked = prefs.getStringSet("blocked", emptySet()) ?: emptySet()
                   val key = Util.last10(number)
                   val isBlocked = key.isNotEmpty() && blocked.any { Util.last10(it) == key }
-                  val silenceUnknown = prefs.getBoolean("silence_unknown", false)
+                  val policy = prefs.getString("unknown_policy", "ring") ?: "ring"
                   val incoming = if (Build.VERSION.SDK_INT >= 29) {
                       details.callDirection == Call.Details.DIRECTION_INCOMING
                   } else {
                       true
                   }
+                  val unknown = incoming && number.isNotBlank() && Util.contactName(this, number) == null
 
                   val response = CallResponse.Builder()
                   if (incoming && isBlocked) {
                       response.setDisallowCall(true).setRejectCall(true)
-                  } else if (incoming && silenceUnknown && Build.VERSION.SDK_INT >= 29 &&
-                      Util.contactName(this, number) == null
-                  ) {
+                  } else if (unknown && policy == "decline") {
+                      response.setDisallowCall(true).setRejectCall(true)
+                      sendAssistantSms(number)
+                  } else if (unknown && policy == "silence" && Build.VERSION.SDK_INT >= 29) {
                       response.setSilenceCall(true)
                   }
                   respondToCall(details, response.build())
+              }
+
+              @Suppress("DEPRECATION")
+              private fun smsManager(): SmsManager =
+                  if (Build.VERSION.SDK_INT >= 31) getSystemService(SmsManager::class.java)
+                  else SmsManager.getDefault()
+
+              private fun sendAssistantSms(number: String) {
+                  if (!Util.has(this, Manifest.permission.SEND_SMS)) return
+                  // Only real phone numbers, never short codes or alphanumeric senders.
+                  if (number.any { it.isLetter() } || number.count { it.isDigit() } < 7) return
+                  val prefs = Util.prefs(this)
+                  val sentKey = "sms_" + Util.last10(number)
+                  val now = System.currentTimeMillis()
+                  if (now - prefs.getLong(sentKey, 0L) < 6L * 60 * 60 * 1000) return
+                  prefs.edit().putLong(sentKey, now).apply()
+                  try {
+                      val saved = prefs.getString("assistant_msg", "") ?: ""
+                      val msg = if (saved.isBlank()) Util.DEFAULT_MSG else saved
+                      val sm = smsManager()
+                      sm.sendMultipartTextMessage(number, null, sm.divideMessage(msg), null, null)
+                  } catch (e: Exception) {
+                  }
               }
           }
           EOF_SMARTSCREENINGSERVICE
@@ -242,6 +344,8 @@ jobs:
           import android.content.Intent
           import android.graphics.drawable.Icon
           import android.os.Build
+          import android.os.Handler
+          import android.os.Looper
           import android.telecom.Call
           import android.telecom.CallAudioState
           import android.telecom.InCallService
@@ -260,6 +364,7 @@ jobs:
                   const val NOTIF_ID = 4242
                   var instance: SmartInCallService? = null
                   var channel: MethodChannel? = null
+                  val lookupCache = HashMap<String, Map<String, Any?>>()
               }
 
               private var current: Call? = null
@@ -292,6 +397,7 @@ jobs:
                   current = call
                   ensureEngine()
                   push()
+                  startLookup(call)
                   if (stateOf(call) == Call.STATE_RINGING) showIncomingNotification(call) else openUi()
               }
 
@@ -328,11 +434,28 @@ jobs:
                   val map = HashMap<String, Any?>()
                   map["state"] = stateName(call)
                   map["number"] = number
-                  map["name"] = Util.contactName(this, number) ?: ""
+                  val info = lookupCache[Util.last10(number)]
+                  map["name"] = Util.contactName(this, number) ?: ((info?.get("name") as? String) ?: "")
+                  map["spam"] = info?.get("spam") == true
                   map["connectTime"] = call.details?.connectTimeMillis ?: 0L
                   map["muted"] = audio?.isMuted ?: false
                   map["speaker"] = audio?.route == CallAudioState.ROUTE_SPEAKER
                   return map
+              }
+
+              private fun startLookup(call: Call) {
+                  val number = call.details?.handle?.schemeSpecificPart ?: ""
+                  if (number.isBlank() || Util.contactName(this, number) != null) return
+                  val key = Util.last10(number)
+                  if (lookupCache.containsKey(key)) return
+                  val ctx = applicationContext
+                  Thread {
+                      val r = Lookup.find(ctx, number)
+                      if (r != null) {
+                          lookupCache[key] = r
+                          Handler(Looper.getMainLooper()).post { push() }
+                      }
+                  }.start()
               }
 
               private fun push() {
@@ -548,10 +671,42 @@ jobs:
                                   dialNumber = null
                               }
                               "getSettings" -> result.success(settingsMap())
-                              "setSilenceUnknown" -> {
+                              "setUnknownPolicy" -> {
                                   Util.prefs(this).edit()
-                                      .putBoolean("silence_unknown", call.argument<Boolean>("value") ?: false)
+                                      .putString("unknown_policy", call.argument<String>("value") ?: "ring")
                                       .apply()
+                                  result.success(true)
+                              }
+                              "setAssistantMessage" -> {
+                                  Util.prefs(this).edit()
+                                      .putString("assistant_msg", call.argument<String>("value") ?: "")
+                                      .apply()
+                                  result.success(true)
+                              }
+                              "setServerUrl" -> {
+                                  Util.prefs(this).edit()
+                                      .putString("server_url", call.argument<String>("value") ?: "")
+                                      .apply()
+                                  result.success(true)
+                              }
+                              "lookupNumber" -> {
+                                  val number = call.argument<String>("number") ?: ""
+                                  Thread {
+                                      val r = Lookup.find(this, number)
+                                      runOnUiThread {
+                                          if (r != null) {
+                                              result.success(r)
+                                          } else {
+                                              result.success(hashMapOf<String, Any?>("found" to false))
+                                          }
+                                      }
+                                  }.start()
+                              }
+                              "reportNumber" -> {
+                                  val number = call.argument<String>("number") ?: ""
+                                  val kind = call.argument<String>("kind") ?: "spam"
+                                  val name = call.argument<String>("name") ?: ""
+                                  Thread { Lookup.report(this, number, kind, name) }.start()
                                   result.success(true)
                               }
                               "setBlocked" -> {
@@ -759,7 +914,9 @@ jobs:
                   val map = HashMap<String, Any?>()
                   map["isDialer"] = isDefaultDialer()
                   map["isCallerId"] = isCallerIdRole()
-                  map["silenceUnknown"] = prefs.getBoolean("silence_unknown", false)
+                  map["unknownPolicy"] = prefs.getString("unknown_policy", "ring") ?: "ring"
+                  map["assistantMessage"] = prefs.getString("assistant_msg", "") ?: ""
+                  map["serverUrl"] = prefs.getString("server_url", "") ?: ""
                   map["blocked"] = ArrayList<String>(prefs.getStringSet("blocked", emptySet()) ?: emptySet())
                   return map
               }
@@ -784,15 +941,74 @@ jobs:
               }
           }
           EOF_MAINACTIVITY
+          mkdir -p "$(dirname android/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml)"
+          cat > android/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml <<'EOF_ICON0'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@drawable/ic_launcher_background"/>
+              <foreground android:drawable="@drawable/ic_launcher_foreground"/>
+          </adaptive-icon>
+          EOF_ICON0
+          mkdir -p "$(dirname android/app/src/main/res/drawable/ic_launcher_background.xml)"
+          cat > android/app/src/main/res/drawable/ic_launcher_background.xml <<'EOF_ICON1'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+              <gradient android:angle="315" android:startColor="#3B82F6" android:endColor="#1E3A8A"/>
+          </shape>
+          EOF_ICON1
+          mkdir -p "$(dirname android/app/src/main/res/drawable/ic_launcher_foreground.xml)"
+          cat > android/app/src/main/res/drawable/ic_launcher_foreground.xml <<'EOF_ICON2'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <group
+                  android:scaleX="1.85"
+                  android:scaleY="1.85"
+                  android:translateX="31.8"
+                  android:translateY="33">
+                  <path
+                      android:fillColor="#FFFFFF"
+                      android:pathData="M6.62,10.79c1.44,2.83 3.76,5.14 6.59,6.59l2.2,-2.2c0.27,-0.27 0.67,-0.36 1.02,-0.24 1.12,0.37 2.33,0.57 3.57,0.57 0.55,0 1,0.45 1,1V20c0,0.55 -0.45,1 -1,1 -9.39,0 -17,-7.61 -17,-17 0,-0.55 0.45,-1 1,-1h3.5c0.55,0 1,0.45 1,1 0,1.25 0.2,2.45 0.57,3.57 0.11,0.35 0.03,0.74 -0.25,1.02l-2.2,2.2z"/>
+              </group>
+              <path
+                  android:fillColor="#16A34A"
+                  android:pathData="M63,36a11,11 0 1,0 22,0a11,11 0 1,0 -22,0z"/>
+              <path
+                  android:fillColor="#00000000"
+                  android:strokeColor="#FFFFFF"
+                  android:strokeWidth="3"
+                  android:strokeLineCap="round"
+                  android:strokeLineJoin="round"
+                  android:pathData="M68.5,36.5 L72.5,40.5 L79.5,32"/>
+          </vector>
+          EOF_ICON2
 
       - run: flutter pub get
       - run: flutter build apk --release
       - run: flutter build web --release --base-href "/${{ github.event.repository.name }}/"
 
+      - name: Sign APK with a fixed key
+        continue-on-error: true
+        run: |
+          if [ ! -f eduserv.jks ]; then
+            keytool -genkeypair -keystore eduserv.jks -alias eduserv -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass eduserv-caller -keypass eduserv-caller -dname "CN=EduServ Caller, O=EduServ, C=IN"
+          fi
+          APKSIGNER=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)
+          "$APKSIGNER" sign --ks eduserv.jks --ks-key-alias eduserv --ks-pass pass:eduserv-caller \
+            --key-pass pass:eduserv-caller --out /tmp/signed.apk build/app/outputs/flutter-apk/app-release.apk
+          cp /tmp/signed.apk build/app/outputs/flutter-apk/app-release.apk
+
+      - name: Name the APK
+        run: cp build/app/outputs/flutter-apk/app-release.apk build/EduServ-Caller.apk
+
       - uses: actions/upload-artifact@v4
         with:
-          name: smart-dialer-apk
-          path: build/app/outputs/flutter-apk/app-release.apk
+          name: EduServ-Caller-apk
+          path: build/EduServ-Caller.apk
 
       - name: Publish web preview (GitHub Pages)
         uses: peaceiris/actions-gh-pages@v4
