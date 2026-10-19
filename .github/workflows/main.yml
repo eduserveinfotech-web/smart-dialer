@@ -32,78 +32,561 @@ jobs:
           cp /tmp/pubspec.yaml pubspec.yaml
           rm -rf test
 
-      - name: Add Android permissions and native code
+      - name: Add Android permissions, services and native code
         run: |
           python3 - <<'PY'
+
           p = 'android/app/src/main/AndroidManifest.xml'
           s = open(p).read()
-          names = ['READ_CALL_LOG', 'READ_CONTACTS', 'CALL_PHONE']
+          names = ['READ_CALL_LOG', 'READ_CONTACTS', 'CALL_PHONE', 'READ_PHONE_STATE',
+                   'READ_SMS', 'SEND_SMS', 'POST_NOTIFICATIONS', 'USE_FULL_SCREEN_INTENT']
           perms = ''.join('    <uses-permission android:name="android.permission.%s"/>\n' % n for n in names)
           s = s.replace('<application', perms + '    <application', 1)
           s = s.replace('android:label="smart_dialer"', 'android:label="Smart Dialer"')
+
+          main_filters = """
+                      <intent-filter>
+                          <action android:name="android.intent.action.DIAL"/>
+                          <category android:name="android.intent.category.DEFAULT"/>
+                      </intent-filter>
+                      <intent-filter>
+                          <action android:name="android.intent.action.DIAL"/>
+                          <category android:name="android.intent.category.DEFAULT"/>
+                          <data android:scheme="tel"/>
+                      </intent-filter>
+                      <intent-filter>
+                          <action android:name="android.intent.action.VIEW"/>
+                          <category android:name="android.intent.category.DEFAULT"/>
+                          <category android:name="android.intent.category.BROWSABLE"/>
+                          <data android:scheme="tel"/>
+                      </intent-filter>
+                  """
+          i = s.index('</activity>')
+          s = s[:i] + main_filters + s[i:]
+
+          components = """
+                  <activity
+                      android:name=".InCallActivity"
+                      android:exported="false"
+                      android:launchMode="singleTask"
+                      android:taskAffinity=""
+                      android:showWhenLocked="true"
+                      android:turnScreenOn="true"
+                      android:theme="@style/NormalTheme"
+                      android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
+                      android:hardwareAccelerated="true"
+                      android:windowSoftInputMode="adjustResize"/>
+                  <service
+                      android:name=".SmartInCallService"
+                      android:exported="true"
+                      android:permission="android.permission.BIND_INCALL_SERVICE">
+                      <meta-data android:name="android.telecom.IN_CALL_SERVICE_UI" android:value="true"/>
+                      <meta-data android:name="android.telecom.IN_CALL_SERVICE_RINGING" android:value="false"/>
+                      <intent-filter>
+                          <action android:name="android.telecom.InCallService"/>
+                      </intent-filter>
+                  </service>
+                  <service
+                      android:name=".SmartScreeningService"
+                      android:exported="true"
+                      android:permission="android.permission.BIND_SCREENING_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.telecom.CallScreeningService"/>
+                      </intent-filter>
+                  </service>
+                  <receiver android:name=".CallActionReceiver" android:exported="false"/>
+              """
+          j = s.index('</application>')
+          s = s[:j] + components + s[j:]
           open(p, 'w').write(s)
           PY
           MA=$(find android/app/src/main -name 'MainActivity.*' | head -1)
           DIR=$(dirname "$MA")
           rm -f "$MA"
-          cat > "$DIR/MainActivity.kt" <<'KT'
+          cat > "$DIR/Util.kt" <<'EOF_UTIL'
           package com.example.smart_dialer
 
-          import android.Manifest
-          import android.content.Intent
+          import android.content.Context
           import android.content.pm.PackageManager
           import android.net.Uri
           import android.os.Build
+          import android.provider.ContactsContract
+
+          object Util {
+              fun has(ctx: Context, perm: String): Boolean {
+                  if (Build.VERSION.SDK_INT < 23) return true
+                  return ctx.checkSelfPermission(perm) == PackageManager.PERMISSION_GRANTED
+              }
+
+              fun last10(n: String): String {
+                  val d = n.filter { it.isDigit() }
+                  return if (d.length > 10) d.substring(d.length - 10) else d
+              }
+
+              fun contactName(ctx: Context, number: String): String? {
+                  if (number.isBlank() || !has(ctx, android.Manifest.permission.READ_CONTACTS)) return null
+                  return try {
+                      val uri = Uri.withAppendedPath(
+                          ContactsContract.PhoneLookup.CONTENT_FILTER_URI, Uri.encode(number)
+                      )
+                      ctx.contentResolver.query(
+                          uri, arrayOf(ContactsContract.PhoneLookup.DISPLAY_NAME), null, null, null
+                      )?.use { c -> if (c.moveToFirst()) c.getString(0) else null }
+                  } catch (e: Exception) {
+                      null
+                  }
+              }
+
+              fun prefs(ctx: Context) = ctx.getSharedPreferences("smart_dialer", Context.MODE_PRIVATE)
+          }
+          EOF_UTIL
+          cat > "$DIR/CallActionReceiver.kt" <<'EOF_CALLACTIONRECEIVER'
+          package com.example.smart_dialer
+
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+
+          class CallActionReceiver : BroadcastReceiver() {
+              override fun onReceive(context: Context, intent: Intent) {
+                  when (intent.action) {
+                      "ANSWER" -> SmartInCallService.instance?.answerCurrent()
+                      "DECLINE" -> SmartInCallService.instance?.declineCurrent()
+                  }
+              }
+          }
+          EOF_CALLACTIONRECEIVER
+          cat > "$DIR/InCallActivity.kt" <<'EOF_INCALLACTIVITY'
+          package com.example.smart_dialer
+
+          import android.annotation.SuppressLint
+          import android.os.Build
+          import android.os.Bundle
+          import android.view.WindowManager
+          import io.flutter.embedding.android.FlutterActivity
+
+          @SuppressLint("NewApi")
+          class InCallActivity : FlutterActivity() {
+              companion object {
+                  var current: InCallActivity? = null
+              }
+
+              @Suppress("DEPRECATION")
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  if (Build.VERSION.SDK_INT >= 27) {
+                      setShowWhenLocked(true)
+                      setTurnScreenOn(true)
+                  } else {
+                      window.addFlags(
+                          WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
+                              WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
+                      )
+                  }
+                  window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                  super.onCreate(savedInstanceState)
+                  current = this
+              }
+
+              override fun shouldDestroyEngineWithHost(): Boolean = false
+
+              override fun onDestroy() {
+                  if (current === this) current = null
+                  super.onDestroy()
+              }
+          }
+          EOF_INCALLACTIVITY
+          cat > "$DIR/SmartScreeningService.kt" <<'EOF_SMARTSCREENINGSERVICE'
+          package com.example.smart_dialer
+
+          import android.annotation.SuppressLint
+          import android.os.Build
+          import android.telecom.Call
+          import android.telecom.CallScreeningService
+
+          @SuppressLint("NewApi")
+          class SmartScreeningService : CallScreeningService() {
+              override fun onScreenCall(details: Call.Details) {
+                  val number = details.handle?.schemeSpecificPart ?: ""
+                  val prefs = Util.prefs(this)
+                  val blocked = prefs.getStringSet("blocked", emptySet()) ?: emptySet()
+                  val key = Util.last10(number)
+                  val isBlocked = key.isNotEmpty() && blocked.any { Util.last10(it) == key }
+                  val silenceUnknown = prefs.getBoolean("silence_unknown", false)
+                  val incoming = if (Build.VERSION.SDK_INT >= 29) {
+                      details.callDirection == Call.Details.DIRECTION_INCOMING
+                  } else {
+                      true
+                  }
+
+                  val response = CallResponse.Builder()
+                  if (incoming && isBlocked) {
+                      response.setDisallowCall(true).setRejectCall(true)
+                  } else if (incoming && silenceUnknown && Build.VERSION.SDK_INT >= 29 &&
+                      Util.contactName(this, number) == null
+                  ) {
+                      response.setSilenceCall(true)
+                  }
+                  respondToCall(details, response.build())
+              }
+          }
+          EOF_SMARTSCREENINGSERVICE
+          cat > "$DIR/SmartInCallService.kt" <<'EOF_SMARTINCALLSERVICE'
+          package com.example.smart_dialer
+
+          import android.annotation.SuppressLint
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.content.Context
+          import android.content.Intent
+          import android.graphics.drawable.Icon
+          import android.os.Build
+          import android.telecom.Call
+          import android.telecom.CallAudioState
+          import android.telecom.InCallService
+          import android.telecom.VideoProfile
+          import io.flutter.embedding.android.FlutterActivity
+          import io.flutter.embedding.engine.FlutterEngine
+          import io.flutter.embedding.engine.FlutterEngineCache
+          import io.flutter.embedding.engine.dart.DartExecutor
+          import io.flutter.plugin.common.MethodChannel
+
+          @SuppressLint("NewApi", "MissingPermission")
+          class SmartInCallService : InCallService() {
+
+              companion object {
+                  const val ENGINE_ID = "incall_engine"
+                  const val NOTIF_ID = 4242
+                  var instance: SmartInCallService? = null
+                  var channel: MethodChannel? = null
+              }
+
+              private var current: Call? = null
+
+              private val callback = object : Call.Callback() {
+                  override fun onStateChanged(call: Call, state: Int) {
+                      if (state != Call.STATE_RINGING) cancelNotification()
+                      if (state == Call.STATE_ACTIVE) openUi()
+                      push()
+                  }
+
+                  override fun onDetailsChanged(call: Call, details: Call.Details) {
+                      push()
+                  }
+              }
+
+              override fun onCreate() {
+                  super.onCreate()
+                  instance = this
+              }
+
+              override fun onDestroy() {
+                  instance = null
+                  super.onDestroy()
+              }
+
+              override fun onCallAdded(call: Call) {
+                  super.onCallAdded(call)
+                  call.registerCallback(callback)
+                  current = call
+                  ensureEngine()
+                  push()
+                  if (stateOf(call) == Call.STATE_RINGING) showIncomingNotification(call) else openUi()
+              }
+
+              override fun onCallRemoved(call: Call) {
+                  super.onCallRemoved(call)
+                  call.unregisterCallback(callback)
+                  if (current == call) current = calls.lastOrNull()
+                  cancelNotification()
+                  push()
+              }
+
+              @Suppress("OVERRIDE_DEPRECATION")
+              override fun onCallAudioStateChanged(audioState: CallAudioState?) {
+                  super.onCallAudioStateChanged(audioState)
+                  push()
+              }
+
+              @Suppress("DEPRECATION")
+              private fun stateOf(call: Call): Int = call.state
+
+              private fun stateName(call: Call): String = when (stateOf(call)) {
+                  Call.STATE_RINGING -> "ringing"
+                  Call.STATE_ACTIVE -> "active"
+                  Call.STATE_HOLDING -> "holding"
+                  Call.STATE_DISCONNECTED, Call.STATE_DISCONNECTING -> "ended"
+                  else -> "dialing"
+              }
+
+              @Suppress("DEPRECATION")
+              private fun stateMap(): Map<String, Any?> {
+                  val call = current ?: return hashMapOf<String, Any?>("state" to "none")
+                  val number = call.details?.handle?.schemeSpecificPart ?: ""
+                  val audio: CallAudioState? = callAudioState
+                  val map = HashMap<String, Any?>()
+                  map["state"] = stateName(call)
+                  map["number"] = number
+                  map["name"] = Util.contactName(this, number) ?: ""
+                  map["connectTime"] = call.details?.connectTimeMillis ?: 0L
+                  map["muted"] = audio?.isMuted ?: false
+                  map["speaker"] = audio?.route == CallAudioState.ROUTE_SPEAKER
+                  return map
+              }
+
+              private fun push() {
+                  try {
+                      channel?.invokeMethod("state", stateMap())
+                  } catch (e: Exception) {
+                  }
+              }
+
+              private fun ensureEngine() {
+                  val cache = FlutterEngineCache.getInstance()
+                  if (cache.get(ENGINE_ID) != null) return
+                  val engine = FlutterEngine(applicationContext)
+                  engine.navigationChannel.setInitialRoute("/incall")
+                  engine.dartExecutor.executeDartEntrypoint(DartExecutor.DartEntrypoint.createDefault())
+                  cache.put(ENGINE_ID, engine)
+                  val ch = MethodChannel(engine.dartExecutor.binaryMessenger, "smart_dialer/call")
+                  ch.setMethodCallHandler { m, r ->
+                      val svc = instance
+                      if (svc == null) r.notImplemented() else svc.handle(m.method, m.arguments, r)
+                  }
+                  channel = ch
+              }
+
+              fun handle(method: String, args: Any?, result: MethodChannel.Result) {
+                  val call = current
+                  when (method) {
+                      "getState" -> {
+                          result.success(stateMap())
+                          return
+                      }
+                      "closeUi" -> {
+                          InCallActivity.current?.finishAndRemoveTask()
+                          result.success(true)
+                          return
+                      }
+                      "answer" -> call?.answer(VideoProfile.STATE_AUDIO_ONLY)
+                      "reject" -> call?.reject(false, null)
+                      "rejectWithMessage" -> call?.reject(true, args as? String)
+                      "hangup" -> call?.disconnect()
+                      "hold" -> call?.hold()
+                      "unhold" -> call?.unhold()
+                      "mute" -> setMuted(args as? Boolean ?: false)
+                      "speaker" -> setAudioRoute(
+                          if (args as? Boolean == true) CallAudioState.ROUTE_SPEAKER
+                          else CallAudioState.ROUTE_WIRED_OR_EARPIECE
+                      )
+                      "dtmf" -> {
+                          val ch = (args as? String)?.firstOrNull()
+                          if (call != null && ch != null) {
+                              call.playDtmfTone(ch)
+                              call.stopDtmfTone()
+                          }
+                      }
+                      else -> {
+                          result.notImplemented()
+                          return
+                      }
+                  }
+                  result.success(true)
+              }
+
+              fun answerCurrent() {
+                  current?.answer(VideoProfile.STATE_AUDIO_ONLY)
+                  openUi()
+              }
+
+              fun declineCurrent() {
+                  current?.reject(false, null)
+              }
+
+              private fun uiIntent(): Intent =
+                  FlutterActivity.CachedEngineIntentBuilder(InCallActivity::class.java, ENGINE_ID)
+                      .build(this)
+                      .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
+
+              private fun openUi() {
+                  try {
+                      startActivity(uiIntent())
+                  } catch (e: Exception) {
+                  }
+              }
+
+              @Suppress("DEPRECATION")
+              private fun notificationBuilder(): Notification.Builder =
+                  if (Build.VERSION.SDK_INT >= 26) Notification.Builder(this, "incoming_calls")
+                  else Notification.Builder(this)
+
+              private fun showIncomingNotification(call: Call) {
+                  val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      val ch = NotificationChannel(
+                          "incoming_calls", "Incoming calls", NotificationManager.IMPORTANCE_HIGH
+                      )
+                      ch.setSound(null, null)
+                      nm.createNotificationChannel(ch)
+                  }
+                  val number = call.details?.handle?.schemeSpecificPart ?: ""
+                  val title = Util.contactName(this, number)
+                      ?: (if (number.isBlank()) "Unknown caller" else number)
+                  val flags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                  val full = PendingIntent.getActivity(this, 1, uiIntent(), flags)
+                  val answer = PendingIntent.getBroadcast(
+                      this, 2, Intent(this, CallActionReceiver::class.java).setAction("ANSWER"), flags
+                  )
+                  val decline = PendingIntent.getBroadcast(
+                      this, 3, Intent(this, CallActionReceiver::class.java).setAction("DECLINE"), flags
+                  )
+                  val n = notificationBuilder()
+                      .setSmallIcon(android.R.drawable.sym_call_incoming)
+                      .setContentTitle(title)
+                      .setContentText("Incoming call")
+                      .setCategory(Notification.CATEGORY_CALL)
+                      .setOngoing(true)
+                      .setContentIntent(full)
+                      .setFullScreenIntent(full, true)
+                      .addAction(
+                          Notification.Action.Builder(
+                              Icon.createWithResource(this, android.R.drawable.ic_menu_close_clear_cancel),
+                              "Decline", decline
+                          ).build()
+                      )
+                      .addAction(
+                          Notification.Action.Builder(
+                              Icon.createWithResource(this, android.R.drawable.sym_action_call),
+                              "Answer", answer
+                          ).build()
+                      )
+                      .build()
+                  nm.notify(NOTIF_ID, n)
+              }
+
+              private fun cancelNotification() {
+                  (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).cancel(NOTIF_ID)
+              }
+          }
+          EOF_SMARTINCALLSERVICE
+          cat > "$DIR/MainActivity.kt" <<'EOF_MAINACTIVITY'
+          package com.example.smart_dialer
+
+          import android.Manifest
+          import android.annotation.SuppressLint
+          import android.app.role.RoleManager
+          import android.content.Context
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
           import android.provider.CallLog
           import android.provider.ContactsContract
+          import android.provider.Settings
+          import android.provider.Telephony
+          import android.telecom.TelecomManager
+          import android.telephony.SmsManager
           import io.flutter.embedding.android.FlutterActivity
           import io.flutter.embedding.engine.FlutterEngine
           import io.flutter.plugin.common.MethodChannel
 
+          @SuppressLint("NewApi", "MissingPermission")
           class MainActivity : FlutterActivity() {
-              private val channelName = "smart_dialer/native"
               private val permRequestCode = 4721
               private var pendingResult: MethodChannel.Result? = null
+              private var dialNumber: String? = null
 
-              private val wanted = arrayOf(
-                  Manifest.permission.READ_CALL_LOG,
-                  Manifest.permission.READ_CONTACTS,
-                  Manifest.permission.CALL_PHONE
-              )
+              private fun wanted(): List<String> {
+                  val l = mutableListOf(
+                      Manifest.permission.READ_CALL_LOG,
+                      Manifest.permission.READ_CONTACTS,
+                      Manifest.permission.CALL_PHONE,
+                      Manifest.permission.READ_PHONE_STATE,
+                      Manifest.permission.READ_SMS,
+                      Manifest.permission.SEND_SMS
+                  )
+                  if (Build.VERSION.SDK_INT >= 33) l.add(Manifest.permission.POST_NOTIFICATIONS)
+                  return l
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  readDial(intent)
+              }
+
+              override fun onNewIntent(intent: Intent) {
+                  super.onNewIntent(intent)
+                  readDial(intent)
+              }
+
+              private fun readDial(i: Intent?) {
+                  val d = i?.data
+                  if (d != null && d.scheme == "tel") dialNumber = Uri.decode(d.schemeSpecificPart)
+              }
 
               override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
                   super.configureFlutterEngine(flutterEngine)
-                  MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channelName)
+                  MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "smart_dialer/native")
                       .setMethodCallHandler { call, result ->
                           when (call.method) {
                               "permissionStatus" -> result.success(permissionMap())
                               "requestPermissions" -> requestAll(result)
                               "getCallLog" -> result.success(readCallLog())
                               "getContacts" -> result.success(readContacts())
+                              "getSmsThreads" -> result.success(readThreads())
+                              "getSmsMessages" ->
+                                  result.success(readMessages(call.argument<Number>("threadId")?.toLong() ?: -1L))
+                              "sendSms" -> sendSms(
+                                  call.argument<String>("address") ?: "",
+                                  call.argument<String>("body") ?: "",
+                                  result
+                              )
                               "call" -> placeCall(call.argument<String>("number") ?: "", result)
+                              "takeDialNumber" -> {
+                                  result.success(dialNumber)
+                                  dialNumber = null
+                              }
+                              "getSettings" -> result.success(settingsMap())
+                              "setSilenceUnknown" -> {
+                                  Util.prefs(this).edit()
+                                      .putBoolean("silence_unknown", call.argument<Boolean>("value") ?: false)
+                                      .apply()
+                                  result.success(true)
+                              }
+                              "setBlocked" -> {
+                                  val list = call.argument<List<String>>("numbers") ?: emptyList()
+                                  Util.prefs(this).edit().putStringSet("blocked", list.toSet()).apply()
+                                  result.success(true)
+                              }
+                              "requestDefaultDialer" -> result.success(requestRole("dialer"))
+                              "requestCallerId" -> result.success(requestRole("screening"))
+                              "openAppSettings" -> {
+                                  startActivity(
+                                      Intent(
+                                          Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                          Uri.fromParts("package", packageName, null)
+                                      )
+                                  )
+                                  result.success(true)
+                              }
                               else -> result.notImplemented()
                           }
                       }
               }
 
-              private fun granted(p: String): Boolean {
-                  if (Build.VERSION.SDK_INT < 23) return true
-                  return checkSelfPermission(p) == PackageManager.PERMISSION_GRANTED
-              }
-
+              // ---------- permissions ----------
               private fun permissionMap(): Map<String, Boolean> = mapOf(
-                  "log" to granted(Manifest.permission.READ_CALL_LOG),
-                  "contacts" to granted(Manifest.permission.READ_CONTACTS),
-                  "call" to granted(Manifest.permission.CALL_PHONE)
+                  "log" to Util.has(this, Manifest.permission.READ_CALL_LOG),
+                  "contacts" to Util.has(this, Manifest.permission.READ_CONTACTS),
+                  "call" to Util.has(this, Manifest.permission.CALL_PHONE),
+                  "sms" to Util.has(this, Manifest.permission.READ_SMS),
+                  "sendSms" to Util.has(this, Manifest.permission.SEND_SMS)
               )
 
               private fun requestAll(result: MethodChannel.Result) {
-                  val missing = wanted.filter { !granted(it) }
-                  if (missing.isEmpty()) {
-                      result.success(permissionMap())
-                      return
-                  }
-                  if (Build.VERSION.SDK_INT < 23) {
+                  val missing = wanted().filter { !Util.has(this, it) }
+                  if (missing.isEmpty() || Build.VERSION.SDK_INT < 23) {
                       result.success(permissionMap())
                       return
                   }
@@ -124,19 +607,16 @@ jobs:
                   }
               }
 
+              // ---------- call log + contacts ----------
               private fun readCallLog(): List<Map<String, Any?>> {
                   val out = ArrayList<Map<String, Any?>>()
-                  if (!granted(Manifest.permission.READ_CALL_LOG)) return out
+                  if (!Util.has(this, Manifest.permission.READ_CALL_LOG)) return out
                   val cols = arrayOf(
-                      CallLog.Calls.NUMBER,
-                      CallLog.Calls.CACHED_NAME,
-                      CallLog.Calls.TYPE,
-                      CallLog.Calls.DATE,
-                      CallLog.Calls.DURATION
+                      CallLog.Calls.NUMBER, CallLog.Calls.CACHED_NAME, CallLog.Calls.TYPE,
+                      CallLog.Calls.DATE, CallLog.Calls.DURATION
                   )
                   contentResolver.query(
-                      CallLog.Calls.CONTENT_URI, cols, null, null,
-                      CallLog.Calls.DATE + " DESC"
+                      CallLog.Calls.CONTENT_URI, cols, null, null, CallLog.Calls.DATE + " DESC"
                   )?.use { c ->
                       var n = 0
                       while (c.moveToNext() && n < 500) {
@@ -155,7 +635,7 @@ jobs:
 
               private fun readContacts(): List<Map<String, Any?>> {
                   val out = ArrayList<Map<String, Any?>>()
-                  if (!granted(Manifest.permission.READ_CONTACTS)) return out
+                  if (!Util.has(this, Manifest.permission.READ_CONTACTS)) return out
                   val cols = arrayOf(
                       ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
                       ContactsContract.CommonDataKinds.Phone.NUMBER
@@ -174,7 +654,78 @@ jobs:
                   return out
               }
 
-              @Suppress("MissingPermission")
+              // ---------- SMS ----------
+              private fun readThreads(): List<Map<String, Any?>> {
+                  val threads = LinkedHashMap<Long, HashMap<String, Any?>>()
+                  if (!Util.has(this, Manifest.permission.READ_SMS)) return ArrayList()
+                  val cols = arrayOf(
+                      Telephony.Sms.THREAD_ID, Telephony.Sms.ADDRESS, Telephony.Sms.BODY,
+                      Telephony.Sms.DATE, Telephony.Sms.TYPE, Telephony.Sms.READ
+                  )
+                  contentResolver.query(
+                      Telephony.Sms.CONTENT_URI, cols, null, null, Telephony.Sms.DATE + " DESC"
+                  )?.use { c ->
+                      var n = 0
+                      while (c.moveToNext() && n < 4000) {
+                          n++
+                          val tid = c.getLong(0)
+                          val row = threads.getOrPut(tid) {
+                              hashMapOf<String, Any?>(
+                                  "threadId" to tid,
+                                  "address" to (c.getString(1) ?: ""),
+                                  "body" to (c.getString(2) ?: ""),
+                                  "date" to c.getLong(3),
+                                  "type" to c.getInt(4),
+                                  "unread" to 0
+                              )
+                          }
+                          if (c.getInt(4) == 1 && c.getInt(5) == 0) {
+                              row["unread"] = (row["unread"] as Int) + 1
+                          }
+                      }
+                  }
+                  return ArrayList(threads.values)
+              }
+
+              private fun readMessages(threadId: Long): List<Map<String, Any?>> {
+                  val out = ArrayList<Map<String, Any?>>()
+                  if (threadId < 0 || !Util.has(this, Manifest.permission.READ_SMS)) return out
+                  val cols = arrayOf(Telephony.Sms.BODY, Telephony.Sms.DATE, Telephony.Sms.TYPE)
+                  contentResolver.query(
+                      Telephony.Sms.CONTENT_URI, cols, Telephony.Sms.THREAD_ID + " = ?",
+                      arrayOf(threadId.toString()), Telephony.Sms.DATE + " ASC"
+                  )?.use { c ->
+                      while (c.moveToNext()) {
+                          val row = HashMap<String, Any?>()
+                          row["body"] = c.getString(0) ?: ""
+                          row["date"] = c.getLong(1)
+                          row["type"] = c.getInt(2)
+                          out.add(row)
+                      }
+                  }
+                  return out
+              }
+
+              @Suppress("DEPRECATION")
+              private fun smsManager(): SmsManager =
+                  if (Build.VERSION.SDK_INT >= 31) getSystemService(SmsManager::class.java)
+                  else SmsManager.getDefault()
+
+              private fun sendSms(address: String, body: String, result: MethodChannel.Result) {
+                  if (!Util.has(this, Manifest.permission.SEND_SMS)) {
+                      result.error("NO_PERMISSION", "SEND_SMS not granted", null)
+                      return
+                  }
+                  try {
+                      val sm = smsManager()
+                      sm.sendMultipartTextMessage(address, null, sm.divideMessage(body), null, null)
+                      result.success(true)
+                  } catch (e: Exception) {
+                      result.error("SMS_FAILED", e.message, null)
+                  }
+              }
+
+              // ---------- calling ----------
               private fun placeCall(number: String, result: MethodChannel.Result) {
                   if (number.isBlank()) {
                       result.error("EMPTY", "No number", null)
@@ -182,7 +733,7 @@ jobs:
                   }
                   try {
                       val uri = Uri.fromParts("tel", number, null)
-                      val action = if (granted(Manifest.permission.CALL_PHONE))
+                      val action = if (Util.has(this, Manifest.permission.CALL_PHONE))
                           Intent.ACTION_CALL else Intent.ACTION_DIAL
                       startActivity(Intent(action, uri))
                       result.success(true)
@@ -190,8 +741,49 @@ jobs:
                       result.error("CALL_FAILED", e.message, null)
                   }
               }
+
+              // ---------- roles + settings ----------
+              private fun isDefaultDialer(): Boolean {
+                  val tm = getSystemService(Context.TELECOM_SERVICE) as? TelecomManager
+                  return tm?.defaultDialerPackage == packageName
+              }
+
+              private fun isCallerIdRole(): Boolean {
+                  if (Build.VERSION.SDK_INT < 29) return false
+                  val rm = getSystemService(Context.ROLE_SERVICE) as? RoleManager ?: return false
+                  return rm.isRoleHeld(RoleManager.ROLE_CALL_SCREENING)
+              }
+
+              private fun settingsMap(): Map<String, Any?> {
+                  val prefs = Util.prefs(this)
+                  val map = HashMap<String, Any?>()
+                  map["isDialer"] = isDefaultDialer()
+                  map["isCallerId"] = isCallerIdRole()
+                  map["silenceUnknown"] = prefs.getBoolean("silence_unknown", false)
+                  map["blocked"] = ArrayList<String>(prefs.getStringSet("blocked", emptySet()) ?: emptySet())
+                  return map
+              }
+
+              private fun requestRole(kind: String): Boolean {
+                  if (Build.VERSION.SDK_INT >= 29) {
+                      val rm = getSystemService(Context.ROLE_SERVICE) as? RoleManager ?: return false
+                      val role = if (kind == "dialer") RoleManager.ROLE_DIALER
+                      else RoleManager.ROLE_CALL_SCREENING
+                      if (!rm.isRoleAvailable(role) || rm.isRoleHeld(role)) return false
+                      @Suppress("DEPRECATION")
+                      startActivityForResult(rm.createRequestRoleIntent(role), 9001)
+                      return true
+                  }
+                  if (kind == "dialer") {
+                      val i = Intent(TelecomManager.ACTION_CHANGE_DEFAULT_DIALER)
+                          .putExtra(TelecomManager.EXTRA_CHANGE_DEFAULT_DIALER_PACKAGE_NAME, packageName)
+                      startActivity(i)
+                      return true
+                  }
+                  return false
+              }
           }
-          KT
+          EOF_MAINACTIVITY
 
       - run: flutter pub get
       - run: flutter build apk --release
